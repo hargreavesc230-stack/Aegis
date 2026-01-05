@@ -29,6 +29,12 @@ no cryptography implemented yet.
 - CLI argument handling and file I/O
 - Error messages that could leak metadata
 
+## Attacker goals (added)
+
+- Tamper with container bytes to alter data or metadata
+- Truncate containers to remove trailing data
+- Reorder or overlap chunks to confuse parsers
+
 ## Goals
 
 - Reject malformed or truncated inputs safely

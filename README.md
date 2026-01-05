@@ -32,8 +32,17 @@ cargo clippy --all-targets --all-features -- -D warnings
 ## CLI examples
 
 ```
-:: Inspect a container header
+:: Inspect a container (with checksum verification)
 cargo run -p aegis-cli -- inspect C:\path\to\container.aegis
+
+:: Pack data into a container
+cargo run -p aegis-cli -- pack C:\path\to\input.bin C:\path\to\output.aegis
+
+:: Pack with metadata
+cargo run -p aegis-cli -- pack C:\path\to\input.bin C:\path\to\output.aegis --metadata C:\path\to\meta.bin
+
+:: Unpack the data chunk
+cargo run -p aegis-cli -- unpack C:\path\to\input.aegis C:\path\to\output.bin
 
 :: Build the CLI and use the .exe directly
 cargo build --release
