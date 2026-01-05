@@ -1,6 +1,13 @@
 [package]
 name = "aegis-format"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
+thiserror = { workspace = true }
+aegis-core = { path = "../aegis-core" }
+
+[dev-dependencies]
+aegis-testkit = { path = "../aegis-testkit" }

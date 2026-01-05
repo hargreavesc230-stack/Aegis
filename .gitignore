@@ -1,0 +1,78 @@
+# =========================
+# Rust / Cargo
+# =========================
+/target/
+Cargo.lock
+**/*.rs.bk
+
+# =========================
+# Windows binaries & build artifacts
+# =========================
+*.exe
+*.dll
+*.pdb
+*.lib
+*.obj
+*.exp
+*.ilk
+
+# =========================
+# OS junk
+# =========================
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# =========================
+# Editor / IDE
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# =========================
+# Logs / traces
+# =========================
+*.log
+*.trace
+logs/
+
+# =========================
+# Coverage / profiling
+# =========================
+coverage/
+*.lcov
+*.profraw
+*.profdata
+
+# =========================
+# Temp files
+# =========================
+*.tmp
+*.temp
+
+# =========================
+# Secrets & cryptographic material
+# =========================
+*.key
+*.pem
+*.pfx
+*.p12
+*.der
+*.crt
+*.csr
+*.secret
+*.secrets
+*.age
+*.vault
+*.token
+.env
+.env.*
+
+# =========================
+# Aegis artifacts
+# =========================
+*.aegis
+*.osf

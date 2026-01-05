@@ -6,3 +6,15 @@ members = [
     "crates/aegis-testkit",
 ]
 resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.74"
+
+[workspace.dependencies]
+thiserror = "1.0.61"
+clap = { version = "4.5.4", features = ["derive"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+zeroize = "1.7.0"

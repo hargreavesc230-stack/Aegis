@@ -1,14 +1,11 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+#![deny(warnings)]
+#![deny(clippy::all)]
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod error;
+pub mod util;
+pub mod version;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use error::AegisError;
+pub use util::{ct_eq, zeroize_bytes};
+
+pub type Result<T> = std::result::Result<T, AegisError>;
