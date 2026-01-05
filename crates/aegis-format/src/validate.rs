@@ -1,19 +1,51 @@
-use crate::acf::{ChunkEntry, FileHeader, FormatError, ACF_VERSION, CHUNK_LEN, HEADER_LEN_U16};
+use aegis_core::crypto::aead::AEAD_NONCE_LEN;
+use aegis_core::crypto::kdf::DEFAULT_SALT_LEN;
+
+use crate::acf::{
+    header_len_v1, ChunkEntry, FileHeader, FormatError, ACF_VERSION_V0, ACF_VERSION_V1, CHUNK_LEN,
+    HEADER_BASE_LEN_U16,
+};
 
 pub fn validate_header(header: &FileHeader) -> Result<(), FormatError> {
-    if header.version != ACF_VERSION {
-        return Err(FormatError::UnsupportedVersion(header.version));
-    }
-
-    if header.header_len != HEADER_LEN_U16 {
-        return Err(FormatError::InvalidHeaderLength {
-            found: header.header_len,
-            expected: HEADER_LEN_U16,
-        });
-    }
-
     if header.flags != 0 {
         return Err(FormatError::UnsupportedFlags(header.flags));
+    }
+
+    match header.version {
+        ACF_VERSION_V0 => {
+            if header.header_len != HEADER_BASE_LEN_U16 {
+                return Err(FormatError::InvalidHeaderLength {
+                    found: header.header_len,
+                    expected: HEADER_BASE_LEN_U16,
+                });
+            }
+            if header.crypto.is_some() {
+                return Err(FormatError::InvalidHeaderLength {
+                    found: header.header_len,
+                    expected: HEADER_BASE_LEN_U16,
+                });
+            }
+        }
+        ACF_VERSION_V1 => {
+            let crypto = header
+                .crypto
+                .as_ref()
+                .ok_or(FormatError::MissingCryptoHeader)?;
+            let expected_len = header_len_v1(&crypto.salt, &crypto.nonce)?;
+            if header.header_len != expected_len {
+                return Err(FormatError::InvalidHeaderLength {
+                    found: header.header_len,
+                    expected: expected_len,
+                });
+            }
+            if crypto.salt.len() != DEFAULT_SALT_LEN {
+                return Err(FormatError::InvalidSaltLength(crypto.salt.len() as u16));
+            }
+            if crypto.nonce.len() != AEAD_NONCE_LEN {
+                return Err(FormatError::InvalidNonceLength(crypto.nonce.len() as u16));
+            }
+        }
+        other => return Err(FormatError::UnsupportedVersion(other)),
     }
 
     let expected_offset = header.header_len as u64;

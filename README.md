@@ -29,6 +29,17 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+## Full system check (cmd.exe)
+
+The integration script `scripts\check.bat` runs formatting, clippy, tests, and
+end-to-end CLI checks. It creates mock inputs and keys, exercises `pack`,
+`inspect`, `unpack`, `keygen`, `enc`, and `dec`, verifies roundtrips, and
+ensures wrong-key and corrupted ciphertext failures.
+
+```
+scripts\check.bat
+```
+
 ## CLI examples
 
 ```
@@ -44,13 +55,16 @@ cargo run -p aegis-cli -- pack C:\path\to\input.bin C:\path\to\output.aegis --me
 :: Unpack the data chunk
 cargo run -p aegis-cli -- unpack C:\path\to\input.aegis C:\path\to\output.bin
 
+:: Generate a key file
+cargo run -p aegis-cli -- keygen C:\path\to\aegis.key
+
+:: Encrypt and decrypt (ACF v1)
+cargo run -p aegis-cli -- enc C:\path\to\input.bin C:\path\to\output.aegis --key C:\path\to\aegis.key
+cargo run -p aegis-cli -- dec C:\path\to\output.aegis C:\path\to\roundtrip.bin --key C:\path\to\aegis.key
+
 :: Build the CLI and use the .exe directly
 cargo build --release
 .\target\release\aegis-cli.exe inspect C:\path\to\container.aegis
-
-:: Stubs (not implemented yet)
-.\target\release\aegis-cli.exe enc C:\path\to\input.bin C:\path\to\output.aegis
-.\target\release\aegis-cli.exe dec C:\path\to\input.aegis C:\path\to\output.bin
 ```
 
 To enable logs:

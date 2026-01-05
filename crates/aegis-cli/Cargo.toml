@@ -11,3 +11,4 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 aegis-format = { path = "../aegis-format" }
+aegis-core = { path = "../aegis-core" }

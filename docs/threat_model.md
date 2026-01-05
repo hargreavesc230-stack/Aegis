@@ -3,17 +3,17 @@
 ## Status
 
 This threat model is an evolving draft. Aegis is not production-ready and has
-no cryptography implemented yet.
+not been externally audited.
 
 ## Assets
 
-- Confidentiality of container payloads
+- Confidentiality of container payloads (ACF v1)
 - Integrity of container metadata and payloads
 - Availability of the CLI tools and container processing
 
 ## Adversaries
 
-- Local attacker with read access to containers
+- Local attacker with read/write access to containers
 - Remote attacker who can provide crafted container files
 - Malware or untrusted software on the same host
 
@@ -29,26 +29,28 @@ no cryptography implemented yet.
 - CLI argument handling and file I/O
 - Error messages that could leak metadata
 
-## Attacker goals (added)
+## Attacker goals
 
 - Tamper with container bytes to alter data or metadata
 - Truncate containers to remove trailing data
 - Reorder or overlap chunks to confuse parsers
+- Substitute ciphertext to induce decryption failures
 
 ## Goals
 
 - Reject malformed or truncated inputs safely
 - Provide clear, structured errors without panics
 - Maintain strict bounds checks on all binary parsing
+- Ensure AEAD authentication fails cleanly on tampering
 
 ## Non-goals (current)
 
-- Resistance to advanced cryptographic attacks (no crypto yet)
-- Side-channel hardening beyond best-effort comparisons
-- Key management, KDFs, or hardware-backed secrets
+- Resistance to side-channel leakage beyond best-effort handling
+- Key management, KDF tuning by user, or hardware-backed secrets
+- Multi-recipient encryption
 
 ## Mitigations (planned)
 
-- Authenticated encryption with standard primitives
+- Authenticated encryption with standard primitives (ACF v1)
 - Domain-separated metadata and payload integrity
 - Explicit versioning and format negotiation

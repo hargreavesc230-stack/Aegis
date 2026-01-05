@@ -2,7 +2,7 @@ use std::io::{self, Cursor, Read, Write};
 
 use aegis_format::{
     read_container, read_container_with_status, write_container, ChunkType, FormatError,
-    WriteChunkSource, CHUNK_LEN, HEADER_LEN,
+    WriteChunkSource, CHUNK_LEN, HEADER_BASE_LEN,
 };
 use aegis_testkit::{flip_byte, sample_bytes};
 
@@ -47,7 +47,7 @@ fn chunk_table_roundtrip_multiple_chunks() {
     assert_eq!(parsed.chunks[0].chunk_type, ChunkType::Data);
     assert_eq!(parsed.chunks[1].chunk_type, ChunkType::Metadata);
 
-    let expected_first_offset = HEADER_LEN as u64 + (2 * CHUNK_LEN) as u64;
+    let expected_first_offset = HEADER_BASE_LEN as u64 + (2 * CHUNK_LEN) as u64;
     let expected_second_offset = expected_first_offset + parsed.chunks[0].length;
     assert_eq!(parsed.chunks[0].offset, expected_first_offset);
     assert_eq!(parsed.chunks[1].offset, expected_second_offset);
@@ -62,8 +62,8 @@ fn overlapping_chunk_detection() {
 
     let mut bytes = build_container_bytes(&mut chunks);
 
-    let second_offset_pos = HEADER_LEN + CHUNK_LEN + 8;
-    let overlapping_offset = (HEADER_LEN as u64 + (2 * CHUNK_LEN) as u64).to_le_bytes();
+    let second_offset_pos = HEADER_BASE_LEN + CHUNK_LEN + 8;
+    let overlapping_offset = (HEADER_BASE_LEN as u64 + (2 * CHUNK_LEN) as u64).to_le_bytes();
     bytes[second_offset_pos..second_offset_pos + 8].copy_from_slice(&overlapping_offset);
 
     let err = read_container(&mut Cursor::new(bytes)).unwrap_err();
@@ -85,7 +85,7 @@ fn corrupted_checksum_detection() {
     let mut chunks = vec![make_chunk(1, ChunkType::Data, sample_bytes(10))];
     let mut bytes = build_container_bytes(&mut chunks);
 
-    let data_offset = HEADER_LEN + CHUNK_LEN;
+    let data_offset = HEADER_BASE_LEN + CHUNK_LEN;
     flip_byte(&mut bytes, data_offset);
 
     let err = read_container(&mut Cursor::new(bytes)).unwrap_err();
@@ -110,7 +110,7 @@ fn large_stream_write_does_not_allocate() {
 
     assert_eq!(written.chunks.len(), 1);
     let expected_len =
-        HEADER_LEN as u64 + CHUNK_LEN as u64 + chunk_len + written.footer.footer_len as u64;
+        HEADER_BASE_LEN as u64 + CHUNK_LEN as u64 + chunk_len + written.footer.footer_len as u64;
     assert_eq!(sink.bytes_written(), expected_len);
 }
 
@@ -118,7 +118,7 @@ fn large_stream_write_does_not_allocate() {
 fn checksum_status_for_inspect() {
     let mut chunks = vec![make_chunk(1, ChunkType::Data, sample_bytes(4))];
     let mut bytes = build_container_bytes(&mut chunks);
-    flip_byte(&mut bytes, HEADER_LEN + CHUNK_LEN);
+    flip_byte(&mut bytes, HEADER_BASE_LEN + CHUNK_LEN);
 
     let parsed = read_container_with_status(&mut Cursor::new(bytes)).expect("inspect read");
     assert!(!parsed.checksum_valid);
