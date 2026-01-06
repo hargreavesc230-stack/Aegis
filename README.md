@@ -178,6 +178,10 @@ Each script cleans prior outputs, builds release binaries, and writes SHA-256
 hashes into the output directory. On Windows, the script iterates over all
 rustup-installed targets and bundles artifacts into `dist\bundle`.
 
+CI releases are produced by `.github/workflows/release.yml` on tags matching
+`v*`. The workflow builds Windows, Linux, and macOS (x86_64 + arm64) artifacts
+and uploads them to the GitHub Release with SHA-256 hashes.
+
 ## Testing and validation
 
 `scripts\check.bat` is the authoritative release gate. A release is invalid unless it passes.
