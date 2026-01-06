@@ -12,6 +12,7 @@ cargo build
 cargo test
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
+scripts\check.bat
 ```
 
 ## Guidelines

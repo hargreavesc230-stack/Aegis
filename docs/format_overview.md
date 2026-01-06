@@ -24,7 +24,9 @@ for multi-recipient envelopes.
 ```
 
 For v1-v3, the `ChunkTable`, `ChunkData`, and `Footer` are encrypted as a single
-payload. Only the header is plaintext and authenticated as AAD.
+payload. Only the header is plaintext and authenticated as AAD. Offsets and
+lengths in the header and chunk table refer to the plaintext layout, not the
+ciphertext layout.
 
 ## FileHeader (base, fixed-size)
 
@@ -38,7 +40,7 @@ Length: 36 bytes
 | 12     | 4    | flags              | Reserved, must be 0                     |
 | 16     | 4    | chunk_count        | Number of chunk table entries           |
 | 20     | 8    | chunk_table_offset | Must equal header_len                   |
-| 28     | 8    | footer_offset      | Byte offset to footer (plaintext)       |
+| 28     | 8    | footer_offset      | Byte offset to footer in plaintext layout |
 
 Rules:
 
@@ -123,9 +125,17 @@ Recipient entries:
 
 Recipient metadata is authenticated as AAD during key wrapping.
 
+Rules:
+
+- At least one recipient is required
+- Recipient IDs must be unique
+- Unknown recipient types or wrap algorithms MUST error
+- wrapped_key_len MUST be bounded and validated before use
+
 ## ChunkTable
 
 Each entry is 24 bytes. Entries MUST be sorted and contiguous by offset.
+Offsets are expressed in the plaintext layout for all versions.
 
 | Offset | Size | Field      | Description                    |
 |--------|------|------------|--------------------------------|

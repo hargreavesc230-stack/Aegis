@@ -13,7 +13,7 @@ compatibility and streaming.
 
 ## Argon2id parameters
 
-Defaults are explicit and constant for v1:
+Defaults are explicit and constant for v1 (not stored in the header):
 
 - Memory: 64 MiB (65536 KiB)
 - Iterations: 3

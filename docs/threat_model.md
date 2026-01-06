@@ -30,6 +30,7 @@ not been externally audited.
 
 - Container parsing and validation logic
 - CLI argument handling and file I/O
+- Recipient rotation and envelope management
 - Error messages that could leak metadata
 
 ## Attacker goals
@@ -56,7 +57,7 @@ not been externally audited.
 - Key management, KDF tuning by user, or hardware-backed secrets
 - Public-key recipients or PKI-backed sharing
 
-## Mitigations (planned)
+## Mitigations (current)
 
 - Authenticated encryption with standard primitives (ACF v1-v3)
 - Key wrapping for password-based and multi-recipient encryption (ACF v2/v3)

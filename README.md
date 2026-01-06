@@ -10,6 +10,7 @@ standard cryptography.
 - `crates/aegis-format`: binary container format parsing and writing (v0-v3)
 - `crates/aegis-cli`: command-line interface with subcommands
 - `crates/aegis-testkit`: shared test helpers and fixtures
+- `crates/aegis-fuzzlite`: deterministic fuzz smoke runner (no external tooling)
 
 ## Security stance
 
@@ -47,7 +48,7 @@ scripts\check.bat
 
 `aegis-fuzzlite` runs a deterministic, dependency-free fuzz smoke test in
 CI and `scripts\check.bat`. It generates adversarial inputs and feeds them
-into the parser and decrypt paths.
+into the parser, decrypt, and rotation paths.
 
 ```
 cargo run -p aegis-fuzzlite -- --iters 1000 --max-len 4096
@@ -83,7 +84,7 @@ cargo run -p aegis-cli -- dec C:\path\to\output.aegis C:\path\to\roundtrip.bin -
 :: List recipients in a container
 cargo run -p aegis-cli -- list-recipients C:\path\to\output.aegis
 
-:: Rotate recipients (add/remove without reusing plaintext)
+:: Rotate recipients (add/remove without re-encrypting the payload)
 cargo run -p aegis-cli -- rotate C:\path\to\output.aegis --output C:\path\to\rotated.aegis --auth-key C:\path\to\aegis.key --add-recipient-key C:\path\to\new.key --remove-recipient 1
 
 :: Build the CLI and use the .exe directly
@@ -101,7 +102,7 @@ set RUST_LOG=info
 ## Roadmap (high level)
 
 - Formalize the container format specification and versioning policy
-- Implement authenticated encryption using standard cryptographic primitives
-- Add streaming key derivation and metadata integrity
+- Add public-key recipients and forward-secrecy options (no PKI yet)
 - Expand CLI with batch tooling, verification, and safe defaults
+- Harden envelope rotation UX and recipient discovery
 - Establish an external security review before production use
