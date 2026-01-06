@@ -19,13 +19,10 @@ touch container parsing or cryptography, run it before submitting.
 
 Rust 1.74 is required (see `Cargo.toml`).
 
-## Release build scripts
+## Release builds
 
-- Windows: `scripts\build_release.bat`
-- Linux/macOS: `scripts/build_release.sh`
-
-The Windows script builds all rustup-installed targets and bundles outputs in
-`dist\bundle`.
+Follow the README build commands for your OS. CI builds are handled in
+`.github/workflows/release.yml`.
 
 ## Guidelines
 
