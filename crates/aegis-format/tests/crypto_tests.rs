@@ -1,9 +1,10 @@
 use std::io::Cursor;
 
 use aegis_format::{
-    decrypt_container_v2, read_header, write_encrypted_container,
-    write_encrypted_container_password, ChunkType, CryptoHeader, FormatError, WrapType,
-    WriteChunkSource, ACF_VERSION_V2, HEADER_BASE_LEN,
+    decrypt_container_v2, decrypt_container_v3, read_header, rotate_container_v3,
+    write_encrypted_container, write_encrypted_container_password, write_encrypted_container_v3,
+    ChunkType, CryptoHeader, FormatError, RecipientSpec, WrapType, WriteChunkSource,
+    ACF_VERSION_V2, HEADER_BASE_LEN,
 };
 use aegis_testkit::{flip_byte, sample_bytes};
 
@@ -238,4 +239,230 @@ fn nonce_uniqueness() {
     };
 
     assert_ne!(nonce_a, nonce_b);
+}
+
+#[test]
+fn multi_recipient_roundtrip_keyfile_password() {
+    let key = vec![0xA1u8; 32];
+    let password = b"multi-pass";
+    let data = sample_bytes(1024);
+    let mut chunks = vec![make_chunk(1, ChunkType::Data, data.clone())];
+
+    let recipients = vec![
+        RecipientSpec {
+            recipient_id: 1,
+            recipient_type: WrapType::Keyfile,
+            key_material: &key,
+        },
+        RecipientSpec {
+            recipient_id: 2,
+            recipient_type: WrapType::Password,
+            key_material: password,
+        },
+    ];
+
+    let mut container = Vec::new();
+    write_encrypted_container_v3(&mut container, &mut chunks, &recipients).expect("encrypt");
+
+    let mut out_key = Vec::new();
+    decrypt_container_v3(
+        &mut Cursor::new(container.clone()),
+        &mut out_key,
+        &key,
+        WrapType::Keyfile,
+    )
+    .expect("decrypt key");
+    assert_eq!(out_key, data);
+
+    let mut out_password = Vec::new();
+    decrypt_container_v3(
+        &mut Cursor::new(container),
+        &mut out_password,
+        password,
+        WrapType::Password,
+    )
+    .expect("decrypt password");
+    assert_eq!(out_password, data);
+}
+
+#[test]
+fn multi_recipient_wrong_credentials_rejected() {
+    let key = vec![0xB2u8; 32];
+    let password = b"correct-pass";
+    let data = sample_bytes(512);
+    let mut chunks = vec![make_chunk(1, ChunkType::Data, data)];
+
+    let recipients = vec![
+        RecipientSpec {
+            recipient_id: 10,
+            recipient_type: WrapType::Keyfile,
+            key_material: &key,
+        },
+        RecipientSpec {
+            recipient_id: 11,
+            recipient_type: WrapType::Password,
+            key_material: password,
+        },
+    ];
+
+    let mut container = Vec::new();
+    write_encrypted_container_v3(&mut container, &mut chunks, &recipients).expect("encrypt");
+
+    let wrong_key = vec![0xC3u8; 32];
+    let err = decrypt_container_v3(
+        &mut Cursor::new(container.clone()),
+        &mut Vec::new(),
+        &wrong_key,
+        WrapType::Keyfile,
+    )
+    .expect_err("wrong key should fail");
+    assert!(matches!(err, FormatError::Crypto(_)));
+
+    let wrong_password = b"wrong-pass";
+    let err = decrypt_container_v3(
+        &mut Cursor::new(container),
+        &mut Vec::new(),
+        wrong_password,
+        WrapType::Password,
+    )
+    .expect_err("wrong password should fail");
+    assert!(matches!(err, FormatError::Crypto(_)));
+}
+
+#[test]
+fn recipient_removal_invalidates_old_credentials() {
+    let key_a = vec![0xD4u8; 32];
+    let key_b = vec![0xE5u8; 32];
+    let data = sample_bytes(256);
+    let mut chunks = vec![make_chunk(1, ChunkType::Data, data.clone())];
+
+    let recipients = vec![
+        RecipientSpec {
+            recipient_id: 1,
+            recipient_type: WrapType::Keyfile,
+            key_material: &key_a,
+        },
+        RecipientSpec {
+            recipient_id: 2,
+            recipient_type: WrapType::Keyfile,
+            key_material: &key_b,
+        },
+    ];
+
+    let mut container = Vec::new();
+    write_encrypted_container_v3(&mut container, &mut chunks, &recipients).expect("encrypt");
+
+    let mut rotated = Vec::new();
+    rotate_container_v3(
+        &mut Cursor::new(container),
+        &mut rotated,
+        &key_b,
+        WrapType::Keyfile,
+        &[],
+        &[1],
+    )
+    .expect("rotate");
+
+    let err = decrypt_container_v3(
+        &mut Cursor::new(rotated.clone()),
+        &mut Vec::new(),
+        &key_a,
+        WrapType::Keyfile,
+    )
+    .expect_err("removed key should fail");
+    assert!(matches!(
+        err,
+        FormatError::Crypto(_) | FormatError::RecipientTypeNotFound
+    ));
+
+    let mut out = Vec::new();
+    decrypt_container_v3(
+        &mut Cursor::new(rotated),
+        &mut out,
+        &key_b,
+        WrapType::Keyfile,
+    )
+    .expect("remaining key should work");
+    assert_eq!(out, data);
+}
+
+#[test]
+fn rotation_preserves_payload() {
+    let key_a = vec![0xF6u8; 32];
+    let key_b = vec![0x17u8; 32];
+    let data = sample_bytes(1024);
+    let mut chunks = vec![make_chunk(1, ChunkType::Data, data.clone())];
+
+    let recipients = vec![
+        RecipientSpec {
+            recipient_id: 5,
+            recipient_type: WrapType::Keyfile,
+            key_material: &key_a,
+        },
+        RecipientSpec {
+            recipient_id: 6,
+            recipient_type: WrapType::Keyfile,
+            key_material: &key_b,
+        },
+    ];
+
+    let mut container = Vec::new();
+    write_encrypted_container_v3(&mut container, &mut chunks, &recipients).expect("encrypt");
+
+    let new_key = vec![0x28u8; 32];
+    let add_specs = vec![RecipientSpec {
+        recipient_id: 7,
+        recipient_type: WrapType::Keyfile,
+        key_material: &new_key,
+    }];
+
+    let mut rotated = Vec::new();
+    rotate_container_v3(
+        &mut Cursor::new(container),
+        &mut rotated,
+        &key_a,
+        WrapType::Keyfile,
+        &add_specs,
+        &[5],
+    )
+    .expect("rotate");
+
+    let mut out = Vec::new();
+    decrypt_container_v3(
+        &mut Cursor::new(rotated),
+        &mut out,
+        &new_key,
+        WrapType::Keyfile,
+    )
+    .expect("decrypt rotated");
+    assert_eq!(out, data);
+}
+
+#[test]
+fn tampered_recipient_entry_rejected() {
+    let key = vec![0x39u8; 32];
+    let data = sample_bytes(128);
+    let mut chunks = vec![make_chunk(1, ChunkType::Data, data)];
+
+    let recipients = vec![RecipientSpec {
+        recipient_id: 1,
+        recipient_type: WrapType::Keyfile,
+        key_material: &key,
+    }];
+
+    let mut container = Vec::new();
+    write_encrypted_container_v3(&mut container, &mut chunks, &recipients).expect("encrypt");
+
+    let (header, _) = read_header(&mut Cursor::new(&container)).expect("header");
+    let offset = header.header_len as usize - 1;
+    flip_byte(&mut container, offset);
+
+    let err = decrypt_container_v3(
+        &mut Cursor::new(container),
+        &mut Vec::new(),
+        &key,
+        WrapType::Keyfile,
+    )
+    .expect_err("tampered recipient should fail");
+    assert!(matches!(err, FormatError::Crypto(_)));
 }

@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 use aegis_core::crypto::keyfile::{generate_key, read_keyfile, write_keyfile};
 use aegis_core::crypto::CryptoError;
 use aegis_format::{
-    decrypt_container, decrypt_container_v2, extract_data_chunk, read_container_with_status,
-    read_header, write_container, write_encrypted_container, write_encrypted_container_password,
-    ChunkType, CryptoHeader, FormatError, ParsedContainer, WrapType, ACF_VERSION_V2,
+    decrypt_container, decrypt_container_v2, decrypt_container_v3, extract_data_chunk,
+    read_container_with_status, read_header, rotate_container_v3, write_container,
+    write_encrypted_container_v3, ChunkType, CryptoHeader, FormatError, ParsedContainer,
+    RecipientSpec, WrapType, ACF_VERSION_V2, ACF_VERSION_V3,
 };
 use clap::{Parser, Subcommand};
 use rpassword::prompt_password;
@@ -55,19 +56,37 @@ enum Commands {
     Enc {
         input: PathBuf,
         output: PathBuf,
-        #[arg(long)]
-        key: Option<PathBuf>,
-        #[arg(long)]
-        password: bool,
+        #[arg(long = "recipient-key", alias = "key", value_name = "PATH")]
+        recipient_keys: Vec<PathBuf>,
+        #[arg(long = "recipient-password", alias = "password")]
+        recipient_password: bool,
     },
     /// Decrypt a container payload
     Dec {
         input: PathBuf,
         output: PathBuf,
+        #[arg(long = "recipient-key", alias = "key", value_name = "PATH")]
+        recipient_key: Option<PathBuf>,
+        #[arg(long = "recipient-password", alias = "password")]
+        recipient_password: bool,
+    },
+    /// List recipients in a v3 container
+    ListRecipients { input: PathBuf },
+    /// Rotate recipients in a v3 container
+    Rotate {
+        input: PathBuf,
         #[arg(long)]
-        key: Option<PathBuf>,
-        #[arg(long)]
-        password: bool,
+        output: PathBuf,
+        #[arg(long = "auth-key", value_name = "PATH")]
+        auth_key: Option<PathBuf>,
+        #[arg(long = "auth-password")]
+        auth_password: bool,
+        #[arg(long = "add-recipient-key", value_name = "PATH")]
+        add_recipient_keys: Vec<PathBuf>,
+        #[arg(long = "add-recipient-password")]
+        add_recipient_password: bool,
+        #[arg(long = "remove-recipient", value_name = "ID")]
+        remove_recipient_ids: Vec<u32>,
     },
 }
 
@@ -111,15 +130,38 @@ fn run() -> i32 {
         Commands::Enc {
             input,
             output,
-            key,
-            password,
-        } => cmd_enc(&input, &output, key.as_deref(), password),
+            recipient_keys,
+            recipient_password,
+        } => cmd_enc(&input, &output, &recipient_keys, recipient_password),
         Commands::Dec {
             input,
             output,
-            key,
-            password,
-        } => cmd_dec(&input, &output, key.as_deref(), password),
+            recipient_key,
+            recipient_password,
+        } => cmd_dec(
+            &input,
+            &output,
+            recipient_key.as_deref(),
+            recipient_password,
+        ),
+        Commands::ListRecipients { input } => cmd_list_recipients(&input),
+        Commands::Rotate {
+            input,
+            output,
+            auth_key,
+            auth_password,
+            add_recipient_keys,
+            add_recipient_password,
+            remove_recipient_ids,
+        } => cmd_rotate(
+            &input,
+            &output,
+            auth_key.as_deref(),
+            auth_password,
+            &add_recipient_keys,
+            add_recipient_password,
+            &remove_recipient_ids,
+        ),
     };
 
     match result {
@@ -172,6 +214,8 @@ fn cmd_inspect(path: &Path) -> Result<(), CliError> {
         print_v1_details(&header);
     } else if header.version == ACF_VERSION_V2 {
         print_v2_details(&header);
+    } else if header.version == ACF_VERSION_V3 {
+        print_v3_details(&header);
     }
 
     Ok(())
@@ -248,9 +292,27 @@ fn resolve_mode<'a>(key_path: Option<&'a Path>, password: bool) -> Result<AuthMo
         (Some(path), false) => Ok(AuthMode::Keyfile(path)),
         (None, true) => Ok(AuthMode::Password),
         (Some(_), true) => Err(CliError::Cli(
-            "choose either --key or --password, not both".to_string(),
+            "choose either --recipient-key or --recipient-password, not both".to_string(),
         )),
-        (None, false) => Err(CliError::Cli("missing --key or --password".to_string())),
+        (None, false) => Err(CliError::Cli(
+            "missing --recipient-key or --recipient-password".to_string(),
+        )),
+    }
+}
+
+fn resolve_auth_mode<'a>(
+    key_path: Option<&'a Path>,
+    password: bool,
+) -> Result<AuthMode<'a>, CliError> {
+    match (key_path, password) {
+        (Some(path), false) => Ok(AuthMode::Keyfile(path)),
+        (None, true) => Ok(AuthMode::Password),
+        (Some(_), true) => Err(CliError::Cli(
+            "choose either --auth-key or --auth-password, not both".to_string(),
+        )),
+        (None, false) => Err(CliError::Cli(
+            "missing --auth-key or --auth-password".to_string(),
+        )),
     }
 }
 
@@ -280,10 +342,14 @@ fn read_password(confirm: bool) -> Result<Zeroizing<Vec<u8>>, CliError> {
 fn cmd_enc(
     input: &Path,
     output: &Path,
-    key_path: Option<&Path>,
-    password: bool,
+    recipient_keys: &[PathBuf],
+    recipient_password: bool,
 ) -> Result<(), CliError> {
-    let mode = resolve_mode(key_path, password)?;
+    if recipient_keys.is_empty() && !recipient_password {
+        return Err(CliError::Cli(
+            "missing --recipient-key or --recipient-password".to_string(),
+        ));
+    }
 
     info!(
         input = %input.display(),
@@ -302,24 +368,176 @@ fn cmd_enc(
         reader: Box::new(input_file),
     }];
 
+    let total_recipients = recipient_keys.len() + if recipient_password { 1 } else { 0 };
+    let mut materials: Vec<(WrapType, Zeroizing<Vec<u8>>)> = Vec::new();
+    materials.reserve_exact(total_recipients);
+
+    for key_path in recipient_keys {
+        let keyfile = read_keyfile(key_path)?;
+        materials.push((WrapType::Keyfile, keyfile.key));
+    }
+
+    if recipient_password {
+        let password_bytes = read_password(true)?;
+        materials.push((WrapType::Password, password_bytes));
+    }
+
+    let mut recipients: Vec<RecipientSpec<'_>> = Vec::with_capacity(materials.len());
+    for (index, (recipient_type, material)) in materials.iter().enumerate() {
+        recipients.push(RecipientSpec {
+            recipient_id: (index as u32) + 1,
+            recipient_type: *recipient_type,
+            key_material: material.as_slice(),
+        });
+    }
+
     let tmp_path = temp_path_for(output);
     let mut output_file = File::create(&tmp_path)?;
 
-    match mode {
-        AuthMode::Keyfile(path) => {
-            let keyfile = read_keyfile(path)?;
-            let _written =
-                write_encrypted_container(&mut output_file, &mut chunks, keyfile.key.as_slice())?;
-        }
-        AuthMode::Password => {
-            let password_bytes = read_password(true)?;
-            let _written = write_encrypted_container_password(
-                &mut output_file,
-                &mut chunks,
-                password_bytes.as_slice(),
-            )?;
-        }
+    let _written = write_encrypted_container_v3(&mut output_file, &mut chunks, &recipients)?;
+
+    finalize_output(&tmp_path, output)?;
+    Ok(())
+}
+
+fn cmd_list_recipients(input: &Path) -> Result<(), CliError> {
+    let mut file = File::open(input)?;
+    let (header, _) = read_header(&mut file)?;
+
+    if header.version != ACF_VERSION_V3 {
+        return Err(CliError::Cli(
+            "recipients are only available in v3 containers".to_string(),
+        ));
     }
+
+    let recipients = match header.crypto.as_ref() {
+        Some(CryptoHeader::V3 { recipients, .. }) => recipients,
+        _ => return Err(CliError::Format(FormatError::MissingCryptoHeader)),
+    };
+
+    println!("Recipients:");
+    for recipient in recipients {
+        println!(
+            "  - id: {} type: {:?} wrap: {:?} wrapped: {} bytes",
+            recipient.recipient_id,
+            recipient.recipient_type,
+            recipient.wrap_alg,
+            recipient.wrapped_key.len()
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_rotate(
+    input: &Path,
+    output: &Path,
+    auth_key: Option<&Path>,
+    auth_password: bool,
+    add_recipient_keys: &[PathBuf],
+    add_recipient_password: bool,
+    remove_recipient_ids: &[u32],
+) -> Result<(), CliError> {
+    if add_recipient_keys.is_empty() && !add_recipient_password && remove_recipient_ids.is_empty() {
+        return Err(CliError::Cli(
+            "rotation requires --add-recipient-key, --add-recipient-password, or --remove-recipient"
+                .to_string(),
+        ));
+    }
+
+    let mut header_file = File::open(input)?;
+    let (header, _) = read_header(&mut header_file)?;
+
+    if header.version != ACF_VERSION_V3 {
+        return Err(CliError::Cli(
+            "rotation only supports v3 containers".to_string(),
+        ));
+    }
+
+    let recipients = match header.crypto.as_ref() {
+        Some(CryptoHeader::V3 { recipients, .. }) => recipients,
+        _ => return Err(CliError::Format(FormatError::MissingCryptoHeader)),
+    };
+
+    let has_key = recipients
+        .iter()
+        .any(|recipient| recipient.recipient_type == WrapType::Keyfile);
+    let has_password = recipients
+        .iter()
+        .any(|recipient| recipient.recipient_type == WrapType::Password);
+
+    let mode = resolve_auth_mode(auth_key, auth_password)?;
+    match &mode {
+        AuthMode::Keyfile(_) if !has_key => {
+            return Err(CliError::Cli(
+                "container expects a password, not a key file".to_string(),
+            ))
+        }
+        AuthMode::Password if !has_password => {
+            return Err(CliError::Cli(
+                "container expects a key file, not a password".to_string(),
+            ))
+        }
+        _ => {}
+    }
+
+    let add_count = add_recipient_keys.len() + if add_recipient_password { 1 } else { 0 };
+    let mut add_materials: Vec<(WrapType, Zeroizing<Vec<u8>>)> = Vec::new();
+    add_materials.reserve_exact(add_count);
+    let mut add_specs: Vec<RecipientSpec<'_>> = Vec::with_capacity(add_count);
+    let next_id = recipients
+        .iter()
+        .map(|recipient| recipient.recipient_id)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+
+    for key_path in add_recipient_keys {
+        let keyfile = read_keyfile(key_path)?;
+        add_materials.push((WrapType::Keyfile, keyfile.key));
+    }
+
+    if add_recipient_password {
+        let password_bytes = read_password(true)?;
+        add_materials.push((WrapType::Password, password_bytes));
+    }
+
+    for (offset, (recipient_type, material)) in add_materials.iter().enumerate() {
+        let recipient_id = next_id.saturating_add(offset as u32);
+        add_specs.push(RecipientSpec {
+            recipient_id,
+            recipient_type: *recipient_type,
+            key_material: material.as_slice(),
+        });
+    }
+
+    let (auth_wrap_type, auth_material) = match mode {
+        AuthMode::Keyfile(path) => (WrapType::Keyfile, read_keyfile(path)?.key),
+        AuthMode::Password => (WrapType::Password, read_password(false)?),
+    };
+
+    info!(
+        input = %input.display(),
+        output = %output.display(),
+        "rotating recipients"
+    );
+
+    let tmp_path = temp_path_for(output);
+    let mut output_file = File::create(&tmp_path)?;
+    let mut input_file = File::open(input)?;
+
+    let result = rotate_container_v3(
+        &mut input_file,
+        &mut output_file,
+        auth_material.as_slice(),
+        auth_wrap_type,
+        &add_specs,
+        remove_recipient_ids,
+    );
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result?;
 
     finalize_output(&tmp_path, output)?;
     Ok(())
@@ -328,21 +546,22 @@ fn cmd_enc(
 fn cmd_dec(
     input: &Path,
     output: &Path,
-    key_path: Option<&Path>,
-    password: bool,
+    recipient_key: Option<&Path>,
+    recipient_password: bool,
 ) -> Result<(), CliError> {
     let mut header_file = File::open(input)?;
     let (header, _) = read_header(&mut header_file)?;
 
     match header.version {
         aegis_format::ACF_VERSION_V1 => {
-            if password {
+            if recipient_password {
                 return Err(CliError::Cli(
                     "v1 containers require a key file, not a password".to_string(),
                 ));
             }
-            let key_path = key_path
-                .ok_or_else(|| CliError::Cli("missing --key for v1 container".to_string()))?;
+            let key_path = recipient_key.ok_or_else(|| {
+                CliError::Cli("missing --recipient-key for v1 container".to_string())
+            })?;
 
             info!(
                 input = %input.display(),
@@ -375,13 +594,13 @@ fn cmd_dec(
 
             match wrap_type {
                 WrapType::Keyfile => {
-                    if password {
+                    if recipient_password {
                         return Err(CliError::Cli(
                             "container expects a key file, not a password".to_string(),
                         ));
                     }
-                    let key_path = key_path.ok_or_else(|| {
-                        CliError::Cli("missing --key for keyfile container".to_string())
+                    let key_path = recipient_key.ok_or_else(|| {
+                        CliError::Cli("missing --recipient-key for keyfile container".to_string())
                     })?;
 
                     info!(
@@ -411,14 +630,14 @@ fn cmd_dec(
                     Ok(())
                 }
                 WrapType::Password => {
-                    if key_path.is_some() {
+                    if recipient_key.is_some() {
                         return Err(CliError::Cli(
                             "container expects a password, not a key file".to_string(),
                         ));
                     }
-                    if !password {
+                    if !recipient_password {
                         return Err(CliError::Cli(
-                            "missing --password for password container".to_string(),
+                            "missing --recipient-password for password container".to_string(),
                         ));
                     }
 
@@ -435,6 +654,89 @@ fn cmd_dec(
                     let mut output_file = File::create(&tmp_path)?;
 
                     let result = decrypt_container_v2(
+                        &mut input_file,
+                        &mut output_file,
+                        password_bytes.as_slice(),
+                        WrapType::Password,
+                    );
+                    if result.is_err() {
+                        let _ = std::fs::remove_file(&tmp_path);
+                    }
+                    result?;
+                    finalize_output(&tmp_path, output)?;
+                    Ok(())
+                }
+            }
+        }
+        ACF_VERSION_V3 => {
+            let recipients = match header.crypto.as_ref() {
+                Some(CryptoHeader::V3 { recipients, .. }) => recipients,
+                _ => return Err(CliError::Format(FormatError::MissingCryptoHeader)),
+            };
+
+            let has_key = recipients
+                .iter()
+                .any(|recipient| recipient.recipient_type == WrapType::Keyfile);
+            let has_password = recipients
+                .iter()
+                .any(|recipient| recipient.recipient_type == WrapType::Password);
+
+            let mode = resolve_mode(recipient_key, recipient_password)?;
+
+            match mode {
+                AuthMode::Keyfile(key_path) => {
+                    if !has_key {
+                        return Err(CliError::Cli(
+                            "container expects a password, not a key file".to_string(),
+                        ));
+                    }
+
+                    info!(
+                        input = %input.display(),
+                        output = %output.display(),
+                        key = %key_path.display(),
+                        "decrypting container"
+                    );
+
+                    let keyfile = read_keyfile(key_path)?;
+                    let mut input_file = File::open(input)?;
+
+                    let tmp_path = temp_path_for(output);
+                    let mut output_file = File::create(&tmp_path)?;
+
+                    let result = decrypt_container_v3(
+                        &mut input_file,
+                        &mut output_file,
+                        keyfile.key.as_slice(),
+                        WrapType::Keyfile,
+                    );
+                    if result.is_err() {
+                        let _ = std::fs::remove_file(&tmp_path);
+                    }
+                    result?;
+                    finalize_output(&tmp_path, output)?;
+                    Ok(())
+                }
+                AuthMode::Password => {
+                    if !has_password {
+                        return Err(CliError::Cli(
+                            "container expects a key file, not a password".to_string(),
+                        ));
+                    }
+
+                    info!(
+                        input = %input.display(),
+                        output = %output.display(),
+                        "decrypting container"
+                    );
+
+                    let password_bytes = read_password(false)?;
+                    let mut input_file = File::open(input)?;
+
+                    let tmp_path = temp_path_for(output);
+                    let mut output_file = File::create(&tmp_path)?;
+
+                    let result = decrypt_container_v3(
                         &mut input_file,
                         &mut output_file,
                         password_bytes.as_slice(),
@@ -542,6 +844,41 @@ fn print_v2_details(header: &aegis_format::FileHeader) {
         println!("  Nonce length: {} bytes", nonce.len());
         println!("  Wrap type: {:?}", wrap_type);
         println!("  Wrapped key length: {} bytes", wrapped_key.len());
+        println!("  Payload: encrypted");
+        return;
+    }
+    println!("  Missing crypto header");
+}
+
+fn print_v3_details(header: &aegis_format::FileHeader) {
+    println!("Encryption (v3):");
+    if let Some(CryptoHeader::V3 {
+        cipher_id,
+        kdf_id,
+        kdf_params,
+        salt,
+        nonce,
+        recipients,
+    }) = header.crypto.as_ref()
+    {
+        println!("  Cipher: {:?}", cipher_id);
+        println!("  KDF: {:?}", kdf_id);
+        println!(
+            "  KDF params: mem={} KiB, iterations={}, parallelism={}",
+            kdf_params.memory_kib, kdf_params.iterations, kdf_params.parallelism
+        );
+        println!("  Salt length: {} bytes", salt.len());
+        println!("  Nonce length: {} bytes", nonce.len());
+        println!("  Recipients: {}", recipients.len());
+        for recipient in recipients {
+            println!(
+                "  - id: {} type: {:?} wrap: {:?} wrapped: {} bytes",
+                recipient.recipient_id,
+                recipient.recipient_type,
+                recipient.wrap_alg,
+                recipient.wrapped_key.len()
+            );
+        }
         println!("  Payload: encrypted");
         return;
     }

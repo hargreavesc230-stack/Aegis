@@ -7,7 +7,7 @@ standard cryptography.
 ## Workspace layout
 
 - `crates/aegis-core`: core utilities, errors, versioning, and constant-time helpers
-- `crates/aegis-format`: binary container format parsing and writing (v0/v1/v2)
+- `crates/aegis-format`: binary container format parsing and writing (v0-v3)
 - `crates/aegis-cli`: command-line interface with subcommands
 - `crates/aegis-testkit`: shared test helpers and fixtures
 
@@ -34,9 +34,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 The integration script `scripts\check.bat` runs formatting, clippy, tests, fuzz
 smoke checks, and end-to-end CLI checks. It creates mock inputs and keys,
-exercises `pack`, `inspect`, `unpack`, `keygen`, `enc`, and `dec`, verifies
-roundtrips, and ensures wrong-key, wrong-password, and corrupted ciphertext
-failures. For automation, it uses `AEGIS_PASSWORD` and `AEGIS_PASSWORD_CONFIRM`.
+exercises `pack`, `inspect`, `unpack`, `keygen`, `enc`, `dec`,
+`list-recipients`, and `rotate`, verifies roundtrips, and ensures wrong-key,
+wrong-password, corrupted ciphertext, and rotation misuse failures. For
+automation, it uses `AEGIS_PASSWORD` and `AEGIS_PASSWORD_CONFIRM`.
 
 ```
 scripts\check.bat
@@ -70,13 +71,20 @@ cargo run -p aegis-cli -- unpack C:\path\to\input.aegis C:\path\to\output.bin
 :: Generate a key file
 cargo run -p aegis-cli -- keygen C:\path\to\aegis.key
 
-:: Encrypt and decrypt with a key file (ACF v2)
-cargo run -p aegis-cli -- enc C:\path\to\input.bin C:\path\to\output.aegis --key C:\path\to\aegis.key
-cargo run -p aegis-cli -- dec C:\path\to\output.aegis C:\path\to\roundtrip.bin --key C:\path\to\aegis.key
+:: Encrypt with multiple recipients (ACF v3)
+cargo run -p aegis-cli -- enc C:\path\to\input.bin C:\path\to\output.aegis --recipient-key C:\path\to\aegis.key --recipient-password
 
-:: Encrypt and decrypt with a password (ACF v2)
-cargo run -p aegis-cli -- enc C:\path\to\input.bin C:\path\to\output.aegis --password
-cargo run -p aegis-cli -- dec C:\path\to\output.aegis C:\path\to\roundtrip.bin --password
+:: Decrypt with a key file (ACF v3)
+cargo run -p aegis-cli -- dec C:\path\to\output.aegis C:\path\to\roundtrip.bin --recipient-key C:\path\to\aegis.key
+
+:: Decrypt with a password (ACF v3)
+cargo run -p aegis-cli -- dec C:\path\to\output.aegis C:\path\to\roundtrip.bin --recipient-password
+
+:: List recipients in a container
+cargo run -p aegis-cli -- list-recipients C:\path\to\output.aegis
+
+:: Rotate recipients (add/remove without reusing plaintext)
+cargo run -p aegis-cli -- rotate C:\path\to\output.aegis --output C:\path\to\rotated.aegis --auth-key C:\path\to\aegis.key --add-recipient-key C:\path\to\new.key --remove-recipient 1
 
 :: Build the CLI and use the .exe directly
 cargo build --release

@@ -1,6 +1,7 @@
 use std::io;
 
 use aegis_core::crypto::ids::{CipherId, KdfId};
+use aegis_core::crypto::wrap::WRAP_AAD_V3_PREFIX;
 use aegis_core::crypto::CryptoError;
 use thiserror::Error;
 
@@ -10,12 +11,15 @@ pub const FOOTER_MAGIC: [u8; 4] = *b"AEGF";
 pub const ACF_VERSION_V0: u16 = 0;
 pub const ACF_VERSION_V1: u16 = 1;
 pub const ACF_VERSION_V2: u16 = 2;
+pub const ACF_VERSION_V3: u16 = 3;
 
 pub const HEADER_BASE_LEN: usize = 36;
 pub const HEADER_BASE_LEN_U16: u16 = 36;
 
 pub const CHUNK_LEN: usize = 24;
 pub const CHUNK_LEN_U16: u16 = 24;
+pub const RECIPIENT_ENTRY_BASE_LEN: usize = 12;
+pub const RECIPIENT_AAD_LEN: usize = 19;
 
 pub const FOOTER_V1_LEN: u32 = 12;
 pub const MAX_HEADER_LEN: usize = 4096;
@@ -89,6 +93,22 @@ impl TryFrom<u16> for WrapType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapAlg {
+    XChaCha20Poly1305 = 0x0001,
+}
+
+impl TryFrom<u16> for WrapAlg {
+    type Error = FormatError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0x0001 => Ok(WrapAlg::XChaCha20Poly1305),
+            other => Err(FormatError::UnsupportedWrapAlg(other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KdfParamsHeader {
     pub memory_kib: u32,
     pub iterations: u32,
@@ -103,6 +123,24 @@ pub struct V2HeaderParams {
     pub salt: Vec<u8>,
     pub nonce: Vec<u8>,
     pub wrap_type: WrapType,
+    pub wrapped_key: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V3HeaderParams {
+    pub cipher_id: CipherId,
+    pub kdf_id: KdfId,
+    pub kdf_params: KdfParamsHeader,
+    pub salt: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub recipients: Vec<RecipientEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipientEntry {
+    pub recipient_id: u32,
+    pub recipient_type: WrapType,
+    pub wrap_alg: WrapAlg,
     pub wrapped_key: Vec<u8>,
 }
 
@@ -122,6 +160,14 @@ pub enum CryptoHeader {
         nonce: Vec<u8>,
         wrap_type: WrapType,
         wrapped_key: Vec<u8>,
+    },
+    V3 {
+        cipher_id: CipherId,
+        kdf_id: KdfId,
+        kdf_params: KdfParamsHeader,
+        salt: Vec<u8>,
+        nonce: Vec<u8>,
+        recipients: Vec<RecipientEntry>,
     },
 }
 
@@ -195,6 +241,30 @@ impl FileHeader {
                 nonce: params.nonce,
                 wrap_type: params.wrap_type,
                 wrapped_key: params.wrapped_key,
+            }),
+        })
+    }
+
+    pub fn new_v3(
+        chunk_count: u32,
+        footer_offset: u64,
+        params: V3HeaderParams,
+    ) -> Result<Self, FormatError> {
+        let header_len = header_len_v3(&params.salt, &params.nonce, &params.recipients)?;
+        Ok(Self {
+            version: ACF_VERSION_V3,
+            header_len,
+            flags: 0,
+            chunk_count,
+            chunk_table_offset: header_len as u64,
+            footer_offset,
+            crypto: Some(CryptoHeader::V3 {
+                cipher_id: params.cipher_id,
+                kdf_id: params.kdf_id,
+                kdf_params: params.kdf_params,
+                salt: params.salt,
+                nonce: params.nonce,
+                recipients: params.recipients,
             }),
         })
     }
@@ -298,8 +368,18 @@ pub enum FormatError {
     UnsupportedChecksumType(u16),
     #[error("unsupported wrap type: {0}")]
     UnsupportedWrapType(u16),
+    #[error("unsupported wrap algorithm: {0}")]
+    UnsupportedWrapAlg(u16),
     #[error("wrap type mismatch")]
     WrapTypeMismatch,
+    #[error("missing recipients section")]
+    MissingRecipients,
+    #[error("duplicate recipient id: {0}")]
+    DuplicateRecipientId(u32),
+    #[error("recipient id not found: {0}")]
+    RecipientIdNotFound(u32),
+    #[error("recipient type not found")]
+    RecipientTypeNotFound,
     #[error("invalid footer length: {found}, expected {expected}")]
     InvalidFooterLength { found: u32, expected: u32 },
     #[error("invalid checksum length: {found}, expected {expected}")]
@@ -310,6 +390,8 @@ pub enum FormatError {
     InvalidNonceLength(u16),
     #[error("invalid wrapped key length: {0}")]
     InvalidWrappedKeyLength(u16),
+    #[error("invalid recipient wrapped key length: {0}")]
+    InvalidRecipientWrappedKeyLength(u32),
     #[error("invalid kdf memory cost: {0}")]
     InvalidKdfMemory(u32),
     #[error("invalid kdf iterations: {0}")]
@@ -385,6 +467,68 @@ pub fn header_len_v2(salt: &[u8], nonce: &[u8], wrapped_key: &[u8]) -> Result<u1
     Ok(total as u16)
 }
 
+pub fn header_len_v3(
+    salt: &[u8],
+    nonce: &[u8],
+    recipients: &[RecipientEntry],
+) -> Result<u16, FormatError> {
+    if salt.is_empty() {
+        return Err(FormatError::InvalidSaltLength(0));
+    }
+    if nonce.is_empty() {
+        return Err(FormatError::InvalidNonceLength(0));
+    }
+    if recipients.is_empty() {
+        return Err(FormatError::MissingRecipients);
+    }
+
+    let salt_len = u16::try_from(salt.len()).map_err(|_| FormatError::InvalidSaltLength(0))?;
+    let nonce_len = u16::try_from(nonce.len()).map_err(|_| FormatError::InvalidNonceLength(0))?;
+
+    let mut total =
+        HEADER_BASE_LEN + 2 + 2 + 4 + 4 + 4 + 2 + salt_len as usize + 2 + nonce_len as usize + 2;
+
+    for recipient in recipients {
+        if recipient.wrapped_key.is_empty() {
+            return Err(FormatError::InvalidRecipientWrappedKeyLength(0));
+        }
+        if recipient.wrapped_key.len() > MAX_WRAPPED_KEY_LEN {
+            return Err(FormatError::InvalidRecipientWrappedKeyLength(
+                recipient.wrapped_key.len() as u32,
+            ));
+        }
+
+        let wrap_len = u32::try_from(recipient.wrapped_key.len())
+            .map_err(|_| FormatError::InvalidRecipientWrappedKeyLength(0))?;
+        total = total
+            .checked_add(RECIPIENT_ENTRY_BASE_LEN)
+            .and_then(|sum| sum.checked_add(wrap_len as usize))
+            .ok_or(FormatError::HeaderTooLarge(total))?;
+    }
+
+    if total > MAX_HEADER_LEN {
+        return Err(FormatError::HeaderTooLarge(total));
+    }
+
+    Ok(total as u16)
+}
+
+pub fn recipient_aad(
+    recipient_id: u32,
+    recipient_type: WrapType,
+    wrap_alg: WrapAlg,
+) -> [u8; RECIPIENT_AAD_LEN] {
+    let mut aad = [0u8; RECIPIENT_AAD_LEN];
+    aad[..WRAP_AAD_V3_PREFIX.len()].copy_from_slice(WRAP_AAD_V3_PREFIX);
+    let mut cursor = WRAP_AAD_V3_PREFIX.len();
+    aad[cursor..cursor + 4].copy_from_slice(&recipient_id.to_le_bytes());
+    cursor += 4;
+    aad[cursor..cursor + 2].copy_from_slice(&(recipient_type as u16).to_le_bytes());
+    cursor += 2;
+    aad[cursor..cursor + 2].copy_from_slice(&(wrap_alg as u16).to_le_bytes());
+    aad
+}
+
 pub fn encode_header(header: &FileHeader) -> Result<Vec<u8>, FormatError> {
     let expected_len = match header.version {
         ACF_VERSION_V0 => HEADER_BASE_LEN_U16,
@@ -407,6 +551,19 @@ pub fn encode_header(header: &FileHeader) -> Result<Vec<u8>, FormatError> {
                 wrapped_key,
                 ..
             } => header_len_v2(salt, nonce, wrapped_key)?,
+            _ => return Err(FormatError::MissingCryptoHeader),
+        },
+        ACF_VERSION_V3 => match header
+            .crypto
+            .as_ref()
+            .ok_or(FormatError::MissingCryptoHeader)?
+        {
+            CryptoHeader::V3 {
+                salt,
+                nonce,
+                recipients,
+                ..
+            } => header_len_v3(salt, nonce, recipients)?,
             _ => return Err(FormatError::MissingCryptoHeader),
         },
         other => return Err(FormatError::UnsupportedVersion(other)),
@@ -507,6 +664,53 @@ pub fn encode_header(header: &FileHeader) -> Result<Vec<u8>, FormatError> {
             buf.extend_from_slice(&(*wrap_type as u16).to_le_bytes());
             buf.extend_from_slice(&wrapped_len.to_le_bytes());
             buf.extend_from_slice(wrapped_key);
+        }
+        ACF_VERSION_V3 => {
+            let crypto = header
+                .crypto
+                .as_ref()
+                .ok_or(FormatError::MissingCryptoHeader)?;
+            let (cipher_id, kdf_id, kdf_params, salt, nonce, recipients) = match crypto {
+                CryptoHeader::V3 {
+                    cipher_id,
+                    kdf_id,
+                    kdf_params,
+                    salt,
+                    nonce,
+                    recipients,
+                } => (cipher_id, kdf_id, kdf_params, salt, nonce, recipients),
+                _ => return Err(FormatError::MissingCryptoHeader),
+            };
+
+            let cipher_id = *cipher_id as u16;
+            let kdf_id = *kdf_id as u16;
+            let salt_len =
+                u16::try_from(salt.len()).map_err(|_| FormatError::InvalidSaltLength(0))?;
+            let nonce_len =
+                u16::try_from(nonce.len()).map_err(|_| FormatError::InvalidNonceLength(0))?;
+            let recipient_count =
+                u16::try_from(recipients.len()).map_err(|_| FormatError::MissingRecipients)?;
+
+            buf.extend_from_slice(&cipher_id.to_le_bytes());
+            buf.extend_from_slice(&kdf_id.to_le_bytes());
+            buf.extend_from_slice(&kdf_params.memory_kib.to_le_bytes());
+            buf.extend_from_slice(&kdf_params.iterations.to_le_bytes());
+            buf.extend_from_slice(&kdf_params.parallelism.to_le_bytes());
+            buf.extend_from_slice(&salt_len.to_le_bytes());
+            buf.extend_from_slice(salt);
+            buf.extend_from_slice(&nonce_len.to_le_bytes());
+            buf.extend_from_slice(nonce);
+            buf.extend_from_slice(&recipient_count.to_le_bytes());
+
+            for recipient in recipients {
+                let wrap_len = u32::try_from(recipient.wrapped_key.len())
+                    .map_err(|_| FormatError::InvalidRecipientWrappedKeyLength(0))?;
+                buf.extend_from_slice(&recipient.recipient_id.to_le_bytes());
+                buf.extend_from_slice(&(recipient.recipient_type as u16).to_le_bytes());
+                buf.extend_from_slice(&(recipient.wrap_alg as u16).to_le_bytes());
+                buf.extend_from_slice(&wrap_len.to_le_bytes());
+                buf.extend_from_slice(&recipient.wrapped_key);
+            }
         }
         _ => {}
     }
@@ -733,6 +937,164 @@ pub fn parse_header(buf: &[u8]) -> Result<FileHeader, FormatError> {
             nonce,
             wrap_type,
             wrapped_key,
+        });
+    } else if version == ACF_VERSION_V3 {
+        if header_len as usize > MAX_HEADER_LEN {
+            return Err(FormatError::HeaderTooLarge(header_len as usize));
+        }
+
+        if buf.len() != header_len as usize {
+            return Err(FormatError::InvalidHeaderLength {
+                found: header_len,
+                expected: buf.len() as u16,
+            });
+        }
+
+        let mut cursor = HEADER_BASE_LEN;
+        if buf.len() < cursor + 2 + 2 + 4 + 4 + 4 + 2 {
+            return Err(FormatError::Truncated);
+        }
+
+        let cipher_id_raw = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]);
+        cursor += 2;
+        let kdf_id_raw = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]);
+        cursor += 2;
+        let memory_kib = u32::from_le_bytes([
+            buf[cursor],
+            buf[cursor + 1],
+            buf[cursor + 2],
+            buf[cursor + 3],
+        ]);
+        cursor += 4;
+        let iterations = u32::from_le_bytes([
+            buf[cursor],
+            buf[cursor + 1],
+            buf[cursor + 2],
+            buf[cursor + 3],
+        ]);
+        cursor += 4;
+        let parallelism = u32::from_le_bytes([
+            buf[cursor],
+            buf[cursor + 1],
+            buf[cursor + 2],
+            buf[cursor + 3],
+        ]);
+        cursor += 4;
+
+        if cursor + 2 > buf.len() {
+            return Err(FormatError::Truncated);
+        }
+        let salt_len = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]);
+        cursor += 2;
+        if salt_len == 0 {
+            return Err(FormatError::InvalidSaltLength(0));
+        }
+
+        let salt_end = cursor + salt_len as usize;
+        if salt_end > buf.len() {
+            return Err(FormatError::Truncated);
+        }
+        let salt = buf[cursor..salt_end].to_vec();
+        cursor = salt_end;
+
+        if cursor + 2 > buf.len() {
+            return Err(FormatError::Truncated);
+        }
+        let nonce_len = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]);
+        cursor += 2;
+        if nonce_len == 0 {
+            return Err(FormatError::InvalidNonceLength(0));
+        }
+
+        let nonce_end = cursor + nonce_len as usize;
+        if nonce_end > buf.len() {
+            return Err(FormatError::Truncated);
+        }
+        let nonce = buf[cursor..nonce_end].to_vec();
+        cursor = nonce_end;
+
+        if cursor + 2 > buf.len() {
+            return Err(FormatError::Truncated);
+        }
+        let recipient_count = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]);
+        cursor += 2;
+        if recipient_count == 0 {
+            return Err(FormatError::MissingRecipients);
+        }
+
+        let mut recipients = Vec::with_capacity(recipient_count as usize);
+        for _ in 0..recipient_count {
+            if cursor + RECIPIENT_ENTRY_BASE_LEN > buf.len() {
+                return Err(FormatError::Truncated);
+            }
+
+            let recipient_id = u32::from_le_bytes([
+                buf[cursor],
+                buf[cursor + 1],
+                buf[cursor + 2],
+                buf[cursor + 3],
+            ]);
+            cursor += 4;
+            let recipient_type_raw = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]);
+            cursor += 2;
+            let wrap_alg_raw = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]);
+            cursor += 2;
+            let wrap_len = u32::from_le_bytes([
+                buf[cursor],
+                buf[cursor + 1],
+                buf[cursor + 2],
+                buf[cursor + 3],
+            ]);
+            cursor += 4;
+
+            if wrap_len == 0 {
+                return Err(FormatError::InvalidRecipientWrappedKeyLength(0));
+            }
+            if wrap_len as usize > MAX_WRAPPED_KEY_LEN {
+                return Err(FormatError::InvalidRecipientWrappedKeyLength(wrap_len));
+            }
+
+            let wrap_end = cursor
+                .checked_add(wrap_len as usize)
+                .ok_or(FormatError::Truncated)?;
+            if wrap_end > buf.len() {
+                return Err(FormatError::Truncated);
+            }
+            let wrapped_key = buf[cursor..wrap_end].to_vec();
+            cursor = wrap_end;
+
+            let recipient_type = WrapType::try_from(recipient_type_raw)?;
+            let wrap_alg = WrapAlg::try_from(wrap_alg_raw)?;
+
+            recipients.push(RecipientEntry {
+                recipient_id,
+                recipient_type,
+                wrap_alg,
+                wrapped_key,
+            });
+        }
+
+        if cursor != buf.len() {
+            return Err(FormatError::InvalidHeaderLength {
+                found: header_len,
+                expected: cursor as u16,
+            });
+        }
+
+        let cipher_id = CipherId::try_from(cipher_id_raw)?;
+        let kdf_id = KdfId::try_from(kdf_id_raw)?;
+
+        crypto = Some(CryptoHeader::V3 {
+            cipher_id,
+            kdf_id,
+            kdf_params: KdfParamsHeader {
+                memory_kib,
+                iterations,
+                parallelism,
+            },
+            salt,
+            nonce,
+            recipients,
         });
     } else {
         return Err(FormatError::UnsupportedVersion(version));

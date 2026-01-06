@@ -4,12 +4,14 @@ use aegis_core::crypto::kdf::{
     KDF_ITERATIONS_MIN, KDF_MEMORY_KIB_MAX, KDF_MEMORY_KIB_MIN, KDF_PARALLELISM_MAX,
     KDF_PARALLELISM_MIN,
 };
+use std::collections::HashSet;
+
 use aegis_core::crypto::wrap::WRAP_NONCE_LEN;
 
 use crate::acf::{
-    header_len_v1, header_len_v2, ChunkEntry, CryptoHeader, FileHeader, FormatError, WrapType,
-    ACF_VERSION_V0, ACF_VERSION_V1, ACF_VERSION_V2, CHUNK_LEN, HEADER_BASE_LEN_U16,
-    MAX_CHUNK_COUNT, MAX_WRAPPED_KEY_LEN,
+    header_len_v1, header_len_v2, header_len_v3, ChunkEntry, CryptoHeader, FileHeader, FormatError,
+    WrapType, ACF_VERSION_V0, ACF_VERSION_V1, ACF_VERSION_V2, ACF_VERSION_V3, CHUNK_LEN,
+    HEADER_BASE_LEN_U16, MAX_CHUNK_COUNT, MAX_WRAPPED_KEY_LEN,
 };
 
 pub fn validate_header(header: &FileHeader) -> Result<(), FormatError> {
@@ -103,6 +105,71 @@ pub fn validate_header(header: &FileHeader) -> Result<(), FormatError> {
             match wrap_type {
                 WrapType::Keyfile => enforce_kdf_minimums(kdf_params, DEFAULT_KEYFILE_PARAMS)?,
                 WrapType::Password => enforce_kdf_minimums(kdf_params, DEFAULT_PASSWORD_PARAMS)?,
+            }
+        }
+        ACF_VERSION_V3 => {
+            let crypto = header
+                .crypto
+                .as_ref()
+                .ok_or(FormatError::MissingCryptoHeader)?;
+            let (kdf_params, salt, nonce, recipients) = match crypto {
+                CryptoHeader::V3 {
+                    kdf_params,
+                    salt,
+                    nonce,
+                    recipients,
+                    ..
+                } => (kdf_params, salt, nonce, recipients),
+                _ => return Err(FormatError::MissingCryptoHeader),
+            };
+            let expected_len = header_len_v3(salt, nonce, recipients)?;
+            if header.header_len != expected_len {
+                return Err(FormatError::InvalidHeaderLength {
+                    found: header.header_len,
+                    expected: expected_len,
+                });
+            }
+            if salt.len() != DEFAULT_SALT_LEN {
+                return Err(FormatError::InvalidSaltLength(salt.len() as u16));
+            }
+            if nonce.len() != AEAD_NONCE_LEN {
+                return Err(FormatError::InvalidNonceLength(nonce.len() as u16));
+            }
+            if recipients.is_empty() {
+                return Err(FormatError::MissingRecipients);
+            }
+
+            let min_wrapped = 2 + WRAP_NONCE_LEN + AEAD_TAG_LEN;
+            let mut ids = HashSet::with_capacity(recipients.len());
+            let mut requires_password_params = false;
+
+            for recipient in recipients {
+                if !ids.insert(recipient.recipient_id) {
+                    return Err(FormatError::DuplicateRecipientId(recipient.recipient_id));
+                }
+                if recipient.wrapped_key.is_empty()
+                    || recipient.wrapped_key.len() > MAX_WRAPPED_KEY_LEN
+                {
+                    return Err(FormatError::InvalidRecipientWrappedKeyLength(
+                        recipient.wrapped_key.len() as u32,
+                    ));
+                }
+                if recipient.wrapped_key.len() < min_wrapped {
+                    return Err(FormatError::InvalidRecipientWrappedKeyLength(
+                        recipient.wrapped_key.len() as u32,
+                    ));
+                }
+
+                if recipient.recipient_type == WrapType::Password {
+                    requires_password_params = true;
+                }
+            }
+
+            validate_kdf_params(kdf_params)?;
+            if requires_password_params {
+                enforce_kdf_minimums(kdf_params, DEFAULT_PASSWORD_PARAMS)?;
+            } else {
+                enforce_kdf_minimums(kdf_params, DEFAULT_KEYFILE_PARAMS)?;
             }
         }
         other => return Err(FormatError::UnsupportedVersion(other)),

@@ -1,17 +1,20 @@
 use std::io::{self, Read, Write};
 
-use aegis_core::crypto::aead::DecryptReader;
+use aegis_core::crypto::aead::{encrypt_stream, DecryptReader};
 use aegis_core::crypto::kdf::KdfParams;
-use aegis_core::crypto::wrap::unwrap_key;
+use aegis_core::crypto::wrap::{unwrap_key, unwrap_key_with_aad, wrap_key_with_aad};
 use aegis_core::io_ext::read_exact_or_err;
 use aegis_core::Crc32;
+use zeroize::Zeroizing;
 
 use crate::acf::{
-    parse_header, ChecksumType, ChunkEntry, ChunkType, CryptoHeader, FileHeader, FooterV0,
-    FooterV1, FormatError, WrapType, ACF_VERSION_V0, ACF_VERSION_V1, ACF_VERSION_V2, CHUNK_LEN,
-    FOOTER_MAGIC, FOOTER_V1_LEN, HEADER_BASE_LEN, MAX_HEADER_LEN,
+    encode_chunk_entry, encode_header, parse_header, recipient_aad, ChecksumType, ChunkEntry,
+    ChunkType, CryptoHeader, FileHeader, FooterV0, FooterV1, FormatError, RecipientEntry,
+    V3HeaderParams, WrapType, ACF_VERSION_V0, ACF_VERSION_V1, ACF_VERSION_V2, ACF_VERSION_V3,
+    CHUNK_LEN, FOOTER_MAGIC, FOOTER_V1_LEN, HEADER_BASE_LEN, MAX_HEADER_LEN,
 };
 use crate::validate::{validate_chunks, validate_header};
+use crate::writer::{RecipientSpec, WrittenEncryptedContainer};
 
 #[derive(Debug, Clone)]
 pub struct ParsedContainer {
@@ -281,6 +284,451 @@ pub fn decrypt_container_v2<R: Read, W: Write>(
         chunks,
         footer,
     })
+}
+
+pub fn decrypt_container_v3<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    key_material: &[u8],
+    recipient_type: WrapType,
+) -> Result<DecryptedContainer, FormatError> {
+    let (header, header_bytes) = read_header(reader)?;
+    if header.version != ACF_VERSION_V3 {
+        return Err(FormatError::UnsupportedVersion(header.version));
+    }
+    validate_header(&header)?;
+
+    let (kdf_params, salt, nonce, recipients) = match header
+        .crypto
+        .as_ref()
+        .ok_or(FormatError::MissingCryptoHeader)?
+    {
+        CryptoHeader::V3 {
+            kdf_params,
+            salt,
+            nonce,
+            recipients,
+            ..
+        } => (kdf_params, salt, nonce, recipients),
+        _ => return Err(FormatError::MissingCryptoHeader),
+    };
+
+    let kdf_params = KdfParams {
+        memory_kib: kdf_params.memory_kib,
+        iterations: kdf_params.iterations,
+        parallelism: kdf_params.parallelism,
+        output_len: aegis_core::crypto::aead::AEAD_KEY_LEN,
+    };
+
+    let data_key = select_data_key_v3(recipients, key_material, recipient_type, kdf_params, salt)?;
+
+    let mut decrypt_reader = DecryptReader::new(reader, data_key.as_slice(), nonce, &header_bytes)?;
+
+    let mut chunks = Vec::with_capacity(header.chunk_count as usize);
+    for _ in 0..header.chunk_count {
+        let mut entry_buf = [0u8; CHUNK_LEN];
+        read_exact_plaintext(&mut decrypt_reader, &mut entry_buf)?;
+
+        let chunk_id = u32::from_le_bytes([entry_buf[0], entry_buf[1], entry_buf[2], entry_buf[3]]);
+        let chunk_type_raw = u16::from_le_bytes([entry_buf[4], entry_buf[5]]);
+        let flags = u16::from_le_bytes([entry_buf[6], entry_buf[7]]);
+        let offset = u64::from_le_bytes([
+            entry_buf[8],
+            entry_buf[9],
+            entry_buf[10],
+            entry_buf[11],
+            entry_buf[12],
+            entry_buf[13],
+            entry_buf[14],
+            entry_buf[15],
+        ]);
+        let length = u64::from_le_bytes([
+            entry_buf[16],
+            entry_buf[17],
+            entry_buf[18],
+            entry_buf[19],
+            entry_buf[20],
+            entry_buf[21],
+            entry_buf[22],
+            entry_buf[23],
+        ]);
+
+        let chunk_type = ChunkType::try_from(chunk_type_raw)?;
+
+        chunks.push(ChunkEntry {
+            chunk_id,
+            chunk_type,
+            flags,
+            offset,
+            length,
+        });
+    }
+
+    let _data_start = validate_chunks(&header, &chunks)?;
+
+    let mut data_chunk_seen = false;
+    for chunk in &chunks {
+        if chunk.chunk_type == ChunkType::Data {
+            if data_chunk_seen {
+                return Err(FormatError::MultipleDataChunks);
+            }
+            data_chunk_seen = true;
+            if chunk.length > 0 {
+                copy_exact_plaintext(&mut decrypt_reader, writer, chunk.length)?;
+            }
+        } else if chunk.length > 0 {
+            skip_exact_plaintext(&mut decrypt_reader, chunk.length)?;
+        }
+    }
+
+    if !data_chunk_seen {
+        return Err(FormatError::MissingDataChunk);
+    }
+
+    let footer = read_footer_v1(&mut decrypt_reader)?;
+    ensure_plaintext_eof(&mut decrypt_reader)?;
+
+    Ok(DecryptedContainer {
+        header,
+        chunks,
+        footer,
+    })
+}
+
+pub fn rotate_container_v3<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    key_material: &[u8],
+    recipient_type: WrapType,
+    add_recipients: &[RecipientSpec<'_>],
+    remove_ids: &[u32],
+) -> Result<WrittenEncryptedContainer, FormatError> {
+    let (header, header_bytes) = read_header(reader)?;
+    if header.version != ACF_VERSION_V3 {
+        return Err(FormatError::UnsupportedVersion(header.version));
+    }
+    validate_header(&header)?;
+
+    let (kdf_params, salt, nonce, existing_recipients) = match header
+        .crypto
+        .as_ref()
+        .ok_or(FormatError::MissingCryptoHeader)?
+    {
+        CryptoHeader::V3 {
+            kdf_params,
+            salt,
+            nonce,
+            recipients,
+            ..
+        } => (kdf_params, salt, nonce, recipients),
+        _ => return Err(FormatError::MissingCryptoHeader),
+    };
+
+    let kdf_params = KdfParams {
+        memory_kib: kdf_params.memory_kib,
+        iterations: kdf_params.iterations,
+        parallelism: kdf_params.parallelism,
+        output_len: aegis_core::crypto::aead::AEAD_KEY_LEN,
+    };
+
+    let data_key = select_data_key_v3(
+        existing_recipients,
+        key_material,
+        recipient_type,
+        kdf_params,
+        salt,
+    )?;
+
+    let mut new_recipients = existing_recipients.clone();
+    let existing_ids: std::collections::HashSet<u32> = new_recipients
+        .iter()
+        .map(|recipient| recipient.recipient_id)
+        .collect();
+    let remove_set: std::collections::HashSet<u32> = remove_ids.iter().copied().collect();
+    for remove_id in &remove_set {
+        if !existing_ids.contains(remove_id) {
+            return Err(FormatError::RecipientIdNotFound(*remove_id));
+        }
+    }
+    if !remove_set.is_empty() {
+        new_recipients.retain(|recipient| !remove_set.contains(&recipient.recipient_id));
+    }
+
+    let mut id_set: std::collections::HashSet<u32> =
+        new_recipients.iter().map(|r| r.recipient_id).collect();
+    for recipient in add_recipients {
+        if !id_set.insert(recipient.recipient_id) {
+            return Err(FormatError::DuplicateRecipientId(recipient.recipient_id));
+        }
+
+        let derived =
+            aegis_core::crypto::kdf::derive_key(recipient.key_material, salt, kdf_params)?;
+        let wrap_alg = crate::acf::WrapAlg::XChaCha20Poly1305;
+        let aad = recipient_aad(recipient.recipient_id, recipient.recipient_type, wrap_alg);
+        let wrapped_key = wrap_key_with_aad(derived.as_slice(), data_key.as_slice(), &aad)?;
+        new_recipients.push(RecipientEntry {
+            recipient_id: recipient.recipient_id,
+            recipient_type: recipient.recipient_type,
+            wrap_alg,
+            wrapped_key,
+        });
+    }
+
+    if new_recipients.is_empty() {
+        return Err(FormatError::MissingRecipients);
+    }
+
+    let mut decrypt_reader = DecryptReader::new(reader, data_key.as_slice(), nonce, &header_bytes)?;
+
+    let table_len = (header.chunk_count as usize)
+        .checked_mul(CHUNK_LEN)
+        .ok_or(FormatError::ChunkCountTooLarge)?;
+    let mut table_bytes = vec![0u8; table_len];
+    read_exact_plaintext(&mut decrypt_reader, &mut table_bytes)?;
+
+    let mut chunks = Vec::with_capacity(header.chunk_count as usize);
+    for entry in table_bytes.chunks_exact(CHUNK_LEN) {
+        let chunk_id = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+        let chunk_type_raw = u16::from_le_bytes([entry[4], entry[5]]);
+        let flags = u16::from_le_bytes([entry[6], entry[7]]);
+        let offset = u64::from_le_bytes([
+            entry[8], entry[9], entry[10], entry[11], entry[12], entry[13], entry[14], entry[15],
+        ]);
+        let length = u64::from_le_bytes([
+            entry[16], entry[17], entry[18], entry[19], entry[20], entry[21], entry[22], entry[23],
+        ]);
+        let chunk_type = ChunkType::try_from(chunk_type_raw)?;
+        chunks.push(ChunkEntry {
+            chunk_id,
+            chunk_type,
+            flags,
+            offset,
+            length,
+        });
+    }
+
+    validate_chunks(&header, &chunks)?;
+
+    let mut new_entries = Vec::with_capacity(chunks.len());
+    let new_header_len = crate::acf::header_len_v3(salt, nonce, &new_recipients)? as u64;
+    let new_data_start = new_header_len
+        .checked_add(table_len as u64)
+        .ok_or(FormatError::ChunkCountTooLarge)?;
+    let mut offset = new_data_start;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let next_offset =
+            offset
+                .checked_add(chunk.length)
+                .ok_or(FormatError::ChunkLengthOverflow {
+                    index: index as u32,
+                })?;
+        new_entries.push(ChunkEntry {
+            chunk_id: chunk.chunk_id,
+            chunk_type: chunk.chunk_type,
+            flags: chunk.flags,
+            offset,
+            length: chunk.length,
+        });
+        offset = next_offset;
+    }
+
+    let footer_offset = offset;
+    let new_header = FileHeader::new_v3(
+        header.chunk_count,
+        footer_offset,
+        V3HeaderParams {
+            cipher_id: header
+                .crypto
+                .as_ref()
+                .and_then(|crypto| match crypto {
+                    CryptoHeader::V3 { cipher_id, .. } => Some(*cipher_id),
+                    _ => None,
+                })
+                .ok_or(FormatError::MissingCryptoHeader)?,
+            kdf_id: header
+                .crypto
+                .as_ref()
+                .and_then(|crypto| match crypto {
+                    CryptoHeader::V3 { kdf_id, .. } => Some(*kdf_id),
+                    _ => None,
+                })
+                .ok_or(FormatError::MissingCryptoHeader)?,
+            kdf_params: crate::acf::KdfParamsHeader {
+                memory_kib: kdf_params.memory_kib,
+                iterations: kdf_params.iterations,
+                parallelism: kdf_params.parallelism,
+            },
+            salt: salt.clone(),
+            nonce: nonce.clone(),
+            recipients: new_recipients,
+        },
+    )?;
+
+    validate_header(&new_header)?;
+    validate_chunks(&new_header, &new_entries)?;
+
+    let header_bytes = encode_header(&new_header)?;
+    writer.write_all(&header_bytes)?;
+
+    let mut new_table_bytes = Vec::with_capacity(new_entries.len() * CHUNK_LEN);
+    for entry in &new_entries {
+        new_table_bytes.extend_from_slice(&encode_chunk_entry(entry));
+    }
+
+    let total_data_len: u64 = chunks.iter().map(|chunk| chunk.length).sum();
+    let mut payload = RotatePayloadReader::new(
+        &new_table_bytes,
+        &mut decrypt_reader,
+        total_data_len,
+        FOOTER_V1_LEN as usize,
+    );
+
+    encrypt_stream(
+        &mut payload,
+        writer,
+        data_key.as_slice(),
+        nonce,
+        &header_bytes,
+    )?;
+
+    ensure_plaintext_eof(&mut decrypt_reader)?;
+
+    Ok(WrittenEncryptedContainer {
+        header: new_header,
+        chunks: new_entries,
+        footer: FooterV1::new(),
+    })
+}
+
+struct RotatePayloadReader<'a, R: Read> {
+    table: &'a [u8],
+    table_pos: usize,
+    reader: &'a mut DecryptReader<R>,
+    data_remaining: u64,
+    footer_len: usize,
+    footer_buf: Vec<u8>,
+    footer_pos: usize,
+    footer_loaded: bool,
+    done: bool,
+}
+
+impl<'a, R: Read> RotatePayloadReader<'a, R> {
+    fn new(
+        table: &'a [u8],
+        reader: &'a mut DecryptReader<R>,
+        data_remaining: u64,
+        footer_len: usize,
+    ) -> Self {
+        Self {
+            table,
+            table_pos: 0,
+            reader,
+            data_remaining,
+            footer_len,
+            footer_buf: Vec::new(),
+            footer_pos: 0,
+            footer_loaded: false,
+            done: false,
+        }
+    }
+}
+
+impl<'a, R: Read> Read for RotatePayloadReader<'a, R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() || self.done {
+            return Ok(0);
+        }
+
+        if self.table_pos < self.table.len() {
+            let remaining = self.table.len() - self.table_pos;
+            let to_copy = std::cmp::min(remaining, out.len());
+            out[..to_copy].copy_from_slice(&self.table[self.table_pos..self.table_pos + to_copy]);
+            self.table_pos += to_copy;
+            return Ok(to_copy);
+        }
+
+        if self.data_remaining > 0 {
+            let to_read = std::cmp::min(self.data_remaining, out.len() as u64) as usize;
+            let read = self.reader.read(&mut out[..to_read])?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated encrypted payload",
+                ));
+            }
+            self.data_remaining = self
+                .data_remaining
+                .checked_sub(read as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "payload underflow"))?;
+            return Ok(read);
+        }
+
+        if !self.footer_loaded {
+            self.footer_buf.resize(self.footer_len, 0);
+            read_exact_plaintext(self.reader, &mut self.footer_buf)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            self.footer_loaded = true;
+        }
+
+        if self.footer_pos < self.footer_buf.len() {
+            let remaining = self.footer_buf.len() - self.footer_pos;
+            let to_copy = std::cmp::min(remaining, out.len());
+            out[..to_copy]
+                .copy_from_slice(&self.footer_buf[self.footer_pos..self.footer_pos + to_copy]);
+            self.footer_pos += to_copy;
+            return Ok(to_copy);
+        }
+
+        self.done = true;
+        Ok(0)
+    }
+}
+
+fn select_data_key_v3(
+    recipients: &[RecipientEntry],
+    key_material: &[u8],
+    recipient_type: WrapType,
+    kdf_params: KdfParams,
+    salt: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, FormatError> {
+    let mut has_candidate = false;
+    let mut derived: Option<Zeroizing<Vec<u8>>> = None;
+
+    for recipient in recipients {
+        if recipient.recipient_type != recipient_type {
+            continue;
+        }
+        has_candidate = true;
+        if derived.is_none() {
+            derived = Some(aegis_core::crypto::kdf::derive_key(
+                key_material,
+                salt,
+                kdf_params,
+            )?);
+        }
+        let derived = derived.as_ref().ok_or(FormatError::MissingCryptoHeader)?;
+        let aad = recipient_aad(
+            recipient.recipient_id,
+            recipient.recipient_type,
+            recipient.wrap_alg,
+        );
+        match unwrap_key_with_aad(derived.as_slice(), &recipient.wrapped_key, &aad) {
+            Ok(key) => return Ok(key),
+            Err(err) => {
+                if !matches!(err, aegis_core::crypto::CryptoError::AuthFailed) {
+                    return Err(FormatError::Crypto(err));
+                }
+            }
+        }
+    }
+
+    if !has_candidate {
+        return Err(FormatError::RecipientTypeNotFound);
+    }
+
+    Err(FormatError::Crypto(
+        aegis_core::crypto::CryptoError::AuthFailed,
+    ))
 }
 
 fn read_container_internal<R: Read>(

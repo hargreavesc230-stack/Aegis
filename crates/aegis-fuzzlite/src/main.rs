@@ -8,11 +8,13 @@ use aegis_core::crypto::kdf::{
 };
 use aegis_format::acf::{encode_header, MAX_HEADER_LEN};
 use aegis_format::{
-    decrypt_container_v2, extract_data_chunk, read_container, read_container_with_status,
-    read_header, write_container, write_encrypted_container, write_encrypted_container_password,
-    ChunkType, FileHeader, KdfParamsHeader, V2HeaderParams, WrapType, WriteChunkSource,
-    ACF_VERSION_V0, ACF_VERSION_V2, CHUNK_LEN, FILE_MAGIC, FOOTER_MAGIC, HEADER_BASE_LEN,
-    MAX_CHUNK_COUNT, MAX_WRAPPED_KEY_LEN,
+    decrypt_container_v2, decrypt_container_v3, extract_data_chunk, read_container,
+    read_container_with_status, read_header, rotate_container_v3, write_container,
+    write_encrypted_container, write_encrypted_container_password, write_encrypted_container_v3,
+    ChunkType, FileHeader, KdfParamsHeader, RecipientEntry, RecipientSpec, V2HeaderParams,
+    V3HeaderParams, WrapAlg, WrapType, WriteChunkSource, ACF_VERSION_V0, ACF_VERSION_V2,
+    ACF_VERSION_V3, CHUNK_LEN, FILE_MAGIC, FOOTER_MAGIC, HEADER_BASE_LEN, MAX_CHUNK_COUNT,
+    MAX_WRAPPED_KEY_LEN, RECIPIENT_ENTRY_BASE_LEN,
 };
 
 const DEFAULT_ITERS: u64 = 200;
@@ -115,6 +117,14 @@ fn build_seeds() -> Vec<SeedCase> {
         });
     }
 
+    if let Ok(header) = build_header_v3() {
+        seeds.push(SeedCase {
+            bytes: header,
+            key: None,
+            wrap: None,
+        });
+    }
+
     if let Ok(container) = build_container_v0() {
         seeds.push(SeedCase {
             bytes: container,
@@ -163,6 +173,30 @@ fn build_seeds() -> Vec<SeedCase> {
         });
     }
 
+    if let Ok((container, key)) = build_container_v3_keyfile() {
+        seeds.push(SeedCase {
+            bytes: container,
+            key: Some(key),
+            wrap: Some(WrapType::Keyfile),
+        });
+    }
+
+    if let Ok((container, password)) = build_container_v3_password() {
+        seeds.push(SeedCase {
+            bytes: container,
+            key: Some(password),
+            wrap: Some(WrapType::Password),
+        });
+    }
+
+    if let Ok((container, key)) = build_container_v3_multi() {
+        seeds.push(SeedCase {
+            bytes: container,
+            key: Some(key),
+            wrap: Some(WrapType::Keyfile),
+        });
+    }
+
     seeds
 }
 
@@ -202,6 +236,42 @@ fn build_header_v2_with_wrap(wrap_type: WrapType) -> Result<Vec<u8>, aegis_forma
             wrapped_key: vec![0x33u8; 40],
         },
     )?;
+    encode_header(&header)
+}
+
+fn build_header_v3() -> Result<Vec<u8>, aegis_format::FormatError> {
+    let recipients = vec![
+        RecipientEntry {
+            recipient_id: 1,
+            recipient_type: WrapType::Keyfile,
+            wrap_alg: WrapAlg::XChaCha20Poly1305,
+            wrapped_key: vec![0x44u8; 40],
+        },
+        RecipientEntry {
+            recipient_id: 2,
+            recipient_type: WrapType::Password,
+            wrap_alg: WrapAlg::XChaCha20Poly1305,
+            wrapped_key: vec![0x55u8; 40],
+        },
+    ];
+
+    let header = FileHeader::new_v3(
+        1,
+        HEADER_BASE_LEN as u64,
+        V3HeaderParams {
+            cipher_id: CipherId::XChaCha20Poly1305,
+            kdf_id: KdfId::Argon2id,
+            kdf_params: KdfParamsHeader {
+                memory_kib: 128 * 1024,
+                iterations: 4,
+                parallelism: 1,
+            },
+            salt: vec![0x11u8; 16],
+            nonce: vec![0x22u8; 20],
+            recipients,
+        },
+    )?;
+
     encode_header(&header)
 }
 
@@ -260,6 +330,57 @@ fn build_container_v2_password_multi() -> Result<(Vec<u8>, Vec<u8>), aegis_forma
     Ok((out, password))
 }
 
+fn build_container_v3_keyfile() -> Result<(Vec<u8>, Vec<u8>), aegis_format::FormatError> {
+    let data = vec![0x1Au8; SEED_DATA_LEN];
+    let mut chunks = make_chunks(vec![(ChunkType::Data, data)]);
+    let key = vec![0x2Bu8; 32];
+    let recipients = vec![RecipientSpec {
+        recipient_id: 1,
+        recipient_type: WrapType::Keyfile,
+        key_material: &key,
+    }];
+    let mut out = Vec::new();
+    write_encrypted_container_v3(&mut out, &mut chunks, &recipients)?;
+    Ok((out, key))
+}
+
+fn build_container_v3_password() -> Result<(Vec<u8>, Vec<u8>), aegis_format::FormatError> {
+    let data = vec![0x3Cu8; SEED_DATA_LEN];
+    let mut chunks = make_chunks(vec![(ChunkType::Data, data)]);
+    let password = b"fuzz-pass-v3".to_vec();
+    let recipients = vec![RecipientSpec {
+        recipient_id: 2,
+        recipient_type: WrapType::Password,
+        key_material: &password,
+    }];
+    let mut out = Vec::new();
+    write_encrypted_container_v3(&mut out, &mut chunks, &recipients)?;
+    Ok((out, password))
+}
+
+fn build_container_v3_multi() -> Result<(Vec<u8>, Vec<u8>), aegis_format::FormatError> {
+    let data = vec![0x4Du8; SEED_DATA_LEN];
+    let meta = vec![0x5Eu8; SEED_DATA_LEN / 2];
+    let mut chunks = make_chunks(vec![(ChunkType::Data, data), (ChunkType::Metadata, meta)]);
+    let key = vec![0x6Fu8; 32];
+    let password = b"fuzz-multi".to_vec();
+    let recipients = vec![
+        RecipientSpec {
+            recipient_id: 10,
+            recipient_type: WrapType::Keyfile,
+            key_material: &key,
+        },
+        RecipientSpec {
+            recipient_id: 11,
+            recipient_type: WrapType::Password,
+            key_material: &password,
+        },
+    ];
+    let mut out = Vec::new();
+    write_encrypted_container_v3(&mut out, &mut chunks, &recipients)?;
+    Ok((out, key))
+}
+
 fn make_chunks(payloads: Vec<(ChunkType, Vec<u8>)>) -> Vec<WriteChunkSource> {
     payloads
         .into_iter()
@@ -282,10 +403,9 @@ fn exercise_valid_seeds(seeds: &[SeedCase]) {
         if let (Some(key), Some(wrap)) = (seed.key.as_ref(), seed.wrap) {
             let mut cursor = Cursor::new(&seed.bytes);
             let mut sink = io::sink();
-            let mut key_buf = [0u8; 32];
-            let to_copy = std::cmp::min(key.len(), key_buf.len());
-            key_buf[..to_copy].copy_from_slice(&key[..to_copy]);
-            let _ = decrypt_container_v2(&mut cursor, &mut sink, &key_buf, wrap);
+            let _ = decrypt_container_v2(&mut cursor, &mut sink, key.as_slice(), wrap);
+            let mut cursor = Cursor::new(&seed.bytes);
+            let _ = decrypt_container_v3(&mut cursor, &mut sink, key.as_slice(), wrap);
         }
     }
 }
@@ -314,10 +434,10 @@ fn random_case(rng: &mut XorShift64, max_len: usize) -> FuzzCase {
     rng.fill_bytes(&mut bytes);
     if bytes.len() >= HEADER_BASE_LEN && rng.next_u64() % 4 == 0 {
         bytes[0..8].copy_from_slice(&FILE_MAGIC);
-        let version = if rng.next_u64() % 2 == 0 {
-            ACF_VERSION_V0
-        } else {
-            ACF_VERSION_V2
+        let version = match rng.next_u64() % 3 {
+            0 => ACF_VERSION_V0,
+            1 => ACF_VERSION_V2,
+            _ => ACF_VERSION_V3,
         };
         bytes[8..10].copy_from_slice(&version.to_le_bytes());
         let header_len = if rng.next_u64() % 2 == 0 {
@@ -350,20 +470,45 @@ fn run_case(stats: &mut FuzzStats, case: &mut FuzzCase) {
         if header.version == ACF_VERSION_V0 {
             let _ = read_container_with_status(&mut Cursor::new(&case.bytes));
             let _ = extract_data_chunk(&mut Cursor::new(&case.bytes), &mut io::sink());
+        } else if header.version == ACF_VERSION_V3 {
+            let add_spec = RecipientSpec {
+                recipient_id: 999,
+                recipient_type: case.wrap,
+                key_material: &case.key,
+            };
+            let _ = rotate_container_v3(
+                &mut Cursor::new(&case.bytes),
+                &mut io::sink(),
+                &case.key,
+                case.wrap,
+                std::slice::from_ref(&add_spec),
+                &[0u32],
+            );
         }
     }
     if read_container(&mut Cursor::new(&case.bytes)).is_ok() {
         stats.container_ok += 1;
     }
     let _ = read_header(&mut Cursor::new(&case.bytes));
-    if decrypt_container_v2(
+    let mut decrypt_ok = decrypt_container_v2(
         &mut Cursor::new(&case.bytes),
         &mut io::sink(),
         &case.key,
         case.wrap,
     )
-    .is_ok()
-    {
+    .is_ok();
+
+    if !decrypt_ok {
+        decrypt_ok = decrypt_container_v3(
+            &mut Cursor::new(&case.bytes),
+            &mut io::sink(),
+            &case.key,
+            case.wrap,
+        )
+        .is_ok();
+    }
+
+    if decrypt_ok {
         stats.decrypt_ok += 1;
     }
 }
@@ -462,10 +607,10 @@ fn structured_header_tweak(rng: &mut XorShift64, bytes: &mut [u8]) {
             bytes[0..8].copy_from_slice(&FILE_MAGIC);
         }
         1 => {
-            let version = if rng.next_u64() % 2 == 0 {
-                ACF_VERSION_V0
-            } else {
-                ACF_VERSION_V2
+            let version = match rng.next_u64() % 3 {
+                0 => ACF_VERSION_V0,
+                1 => ACF_VERSION_V2,
+                _ => ACF_VERSION_V3,
             };
             write_u16(bytes, 8, version);
         }
@@ -580,7 +725,72 @@ fn structured_crypto_tweak(rng: &mut XorShift64, bytes: &mut [u8]) {
         return;
     }
     let version = read_u16(bytes, 8).unwrap_or(0);
-    if version != ACF_VERSION_V2 {
+    if version == ACF_VERSION_V2 {
+        let header_len = read_u16(bytes, 10).unwrap_or(HEADER_BASE_LEN as u16) as usize;
+        let header_len = std::cmp::min(header_len, bytes.len());
+
+        let mut cursor = HEADER_BASE_LEN;
+        let cipher_id_offset = cursor;
+        cursor += 2;
+        let kdf_id_offset = cursor;
+        cursor += 2;
+        let memory_offset = cursor;
+        cursor += 4;
+        let iterations_offset = cursor;
+        cursor += 4;
+        let parallelism_offset = cursor;
+        cursor += 4;
+        if cursor + 2 > header_len {
+            return;
+        }
+        let salt_len_offset = cursor;
+        let salt_len = read_u16(bytes, salt_len_offset).unwrap_or(0) as usize;
+        cursor += 2;
+        let salt_end = cursor.saturating_add(salt_len);
+        if salt_end + 2 > header_len {
+            return;
+        }
+        let nonce_len_offset = salt_end;
+        let nonce_len = read_u16(bytes, nonce_len_offset).unwrap_or(0) as usize;
+        let nonce_start = nonce_len_offset + 2;
+        let nonce_end = nonce_start.saturating_add(nonce_len);
+        if nonce_end + 4 > header_len {
+            return;
+        }
+        let wrap_type_offset = nonce_end;
+        let wrapped_len_offset = wrap_type_offset + 2;
+
+        match rng.next_u64() % 8 {
+            0 => write_u16(bytes, cipher_id_offset, rng.next_u64() as u16),
+            1 => write_u16(bytes, kdf_id_offset, rng.next_u64() as u16),
+            2 => write_u32(bytes, memory_offset, KDF_MEMORY_KIB_MAX),
+            3 => write_u32(bytes, iterations_offset, KDF_ITERATIONS_MAX),
+            4 => write_u32(bytes, parallelism_offset, KDF_PARALLELISM_MAX),
+            5 => {
+                let salt_len = if rng.next_u64() % 2 == 0 { 0 } else { 512 };
+                write_u16(bytes, salt_len_offset, salt_len);
+            }
+            6 => {
+                let wrap_type = if rng.next_u64() % 2 == 0 {
+                    0x0001
+                } else {
+                    0xDEAD
+                };
+                write_u16(bytes, wrap_type_offset, wrap_type);
+            }
+            _ => {
+                let wrapped_len = if rng.next_u64() % 2 == 0 {
+                    0
+                } else {
+                    (MAX_WRAPPED_KEY_LEN as u16).saturating_add(1)
+                };
+                write_u16(bytes, wrapped_len_offset, wrapped_len);
+            }
+        }
+        return;
+    }
+
+    if version != ACF_VERSION_V3 {
         return;
     }
 
@@ -612,13 +822,29 @@ fn structured_crypto_tweak(rng: &mut XorShift64, bytes: &mut [u8]) {
     let nonce_len = read_u16(bytes, nonce_len_offset).unwrap_or(0) as usize;
     let nonce_start = nonce_len_offset + 2;
     let nonce_end = nonce_start.saturating_add(nonce_len);
-    if nonce_end + 4 > header_len {
+    if nonce_end + 2 > header_len {
         return;
     }
-    let wrap_type_offset = nonce_end;
-    let wrapped_len_offset = wrap_type_offset + 2;
+    let recipient_count_offset = nonce_end;
+    let _recipient_count = read_u16(bytes, recipient_count_offset).unwrap_or(0) as usize;
+    let first_entry_offset = recipient_count_offset + 2;
 
-    match rng.next_u64() % 8 {
+    let mut first_entry = None;
+    if first_entry_offset + RECIPIENT_ENTRY_BASE_LEN <= header_len {
+        let wrap_len_offset = first_entry_offset + 8;
+        let wrap_len = read_u32(bytes, wrap_len_offset).unwrap_or(0) as usize;
+        first_entry = Some((first_entry_offset, wrap_len));
+    }
+
+    let mut second_entry_offset = None;
+    if let Some((entry_offset, wrap_len)) = first_entry {
+        let next = entry_offset + RECIPIENT_ENTRY_BASE_LEN + wrap_len;
+        if next + 4 <= header_len {
+            second_entry_offset = Some(next);
+        }
+    }
+
+    match rng.next_u64() % 10 {
         0 => write_u16(bytes, cipher_id_offset, rng.next_u64() as u16),
         1 => write_u16(bytes, kdf_id_offset, rng.next_u64() as u16),
         2 => write_u32(bytes, memory_offset, KDF_MEMORY_KIB_MAX),
@@ -629,20 +855,33 @@ fn structured_crypto_tweak(rng: &mut XorShift64, bytes: &mut [u8]) {
             write_u16(bytes, salt_len_offset, salt_len);
         }
         6 => {
-            let wrap_type = if rng.next_u64() % 2 == 0 {
-                0x0001
-            } else {
-                0xDEAD
-            };
-            write_u16(bytes, wrap_type_offset, wrap_type);
+            let count = if rng.next_u64() % 2 == 0 { 0 } else { 0xFFFF };
+            write_u16(bytes, recipient_count_offset, count);
+        }
+        7 => {
+            if let Some((entry_offset, _)) = first_entry {
+                let wrap_alg_offset = entry_offset + 6;
+                write_u16(bytes, wrap_alg_offset, 0xDEAD);
+            }
+        }
+        8 => {
+            if let Some((entry_offset, _)) = first_entry {
+                let wrap_len_offset = entry_offset + 8;
+                let wrapped_len = if rng.next_u64() % 2 == 0 {
+                    0
+                } else {
+                    (MAX_WRAPPED_KEY_LEN as u32).saturating_add(1)
+                };
+                write_u32(bytes, wrap_len_offset, wrapped_len);
+            }
         }
         _ => {
-            let wrapped_len = if rng.next_u64() % 2 == 0 {
-                0
-            } else {
-                (MAX_WRAPPED_KEY_LEN as u16).saturating_add(1)
-            };
-            write_u16(bytes, wrapped_len_offset, wrapped_len);
+            if let (Some((entry_offset, _)), Some(second_offset)) =
+                (first_entry, second_entry_offset)
+            {
+                let id = read_u32(bytes, entry_offset).unwrap_or(0);
+                write_u32(bytes, second_offset, id);
+            }
         }
     }
 }

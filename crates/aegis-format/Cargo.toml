@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 aegis-core = { path = "../aegis-core" }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 aegis-testkit = { path = "../aegis-testkit" }

@@ -7,9 +7,18 @@ use crate::crypto::aead::{AEAD_KEY_LEN, AEAD_TAG_LEN};
 use crate::crypto::CryptoError;
 
 pub const WRAP_NONCE_LEN: usize = 24;
-pub const WRAP_AAD: &[u8] = b"AEGIS-KW-V2";
+pub const WRAP_AAD_V2: &[u8] = b"AEGIS-KW-V2";
+pub const WRAP_AAD_V3_PREFIX: &[u8] = b"AEGIS-KW-V3";
 
 pub fn wrap_key(wrapping_key: &[u8], data_key: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    wrap_key_with_aad(wrapping_key, data_key, WRAP_AAD_V2)
+}
+
+pub fn wrap_key_with_aad(
+    wrapping_key: &[u8],
+    data_key: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
     if wrapping_key.len() != AEAD_KEY_LEN {
         return Err(CryptoError::InvalidKeyLength {
             expected: AEAD_KEY_LEN,
@@ -28,13 +37,7 @@ pub fn wrap_key(wrapping_key: &[u8], data_key: &[u8]) -> Result<Vec<u8>, CryptoE
 
     let aead = XChaCha20Poly1305::new(Key::from_slice(wrapping_key));
     let ciphertext = aead
-        .encrypt(
-            XNonce::from_slice(&nonce),
-            Payload {
-                msg: data_key,
-                aad: WRAP_AAD,
-            },
-        )
+        .encrypt(XNonce::from_slice(&nonce), Payload { msg: data_key, aad })
         .map_err(|_| CryptoError::AuthFailed)?;
 
     let nonce_len = u16::try_from(nonce.len()).map_err(|_| CryptoError::InvalidWrappedKey)?;
@@ -48,6 +51,14 @@ pub fn wrap_key(wrapping_key: &[u8], data_key: &[u8]) -> Result<Vec<u8>, CryptoE
 pub fn unwrap_key(
     wrapping_key: &[u8],
     wrapped_key: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    unwrap_key_with_aad(wrapping_key, wrapped_key, WRAP_AAD_V2)
+}
+
+pub fn unwrap_key_with_aad(
+    wrapping_key: &[u8],
+    wrapped_key: &[u8],
+    aad: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     if wrapping_key.len() != AEAD_KEY_LEN {
         return Err(CryptoError::InvalidKeyLength {
@@ -81,7 +92,7 @@ pub fn unwrap_key(
             XNonce::from_slice(nonce),
             Payload {
                 msg: ciphertext,
-                aad: WRAP_AAD,
+                aad,
             },
         )
         .map_err(|_| CryptoError::AuthFailed)?;

@@ -1,9 +1,10 @@
-# Format Overview (ACF v0/v1/v2)
+# Format Overview (ACF v0-v3)
 
 Aegis Container Format (ACF) is a deterministic, streaming-first binary layout
 with strict parsing rules. v0 is unencrypted; v1 adds authenticated encryption
 (XChaCha20-Poly1305) while keeping the header in plaintext. v2 adds key wrapping
-so passwords never directly encrypt payloads.
+so passwords never directly encrypt payloads. v3 introduces a recipients table
+for multi-recipient envelopes.
 
 ## Global rules
 
@@ -22,7 +23,7 @@ so passwords never directly encrypt payloads.
 [ Footer ]
 ```
 
-For v1/v2, the `ChunkTable`, `ChunkData`, and `Footer` are encrypted as a single
+For v1-v3, the `ChunkTable`, `ChunkData`, and `Footer` are encrypted as a single
 payload. Only the header is plaintext and authenticated as AAD.
 
 ## FileHeader (base, fixed-size)
@@ -32,7 +33,7 @@ Length: 36 bytes
 | Offset | Size | Field              | Description                             |
 |--------|------|--------------------|-----------------------------------------|
 | 0      | 8    | magic              | ASCII `AEGIS\0\0\0`                   |
-| 8      | 2    | version            | v0 = 0, v1 = 1                          |
+| 8      | 2    | version            | v0 = 0, v1 = 1, v2 = 2, v3 = 3          |
 | 10     | 2    | header_len         | Total header length in bytes            |
 | 12     | 4    | flags              | Reserved, must be 0                     |
 | 16     | 4    | chunk_count        | Number of chunk table entries           |
@@ -92,6 +93,36 @@ u8  ciphertext[data_key_len + tag]
 
 The header is authenticated as AEAD AAD in v2.
 
+## Header extensions (v3)
+
+v3 replaces the single wrapped key with a recipients table. The header stores:
+
+| Field            | Size | Description                         |
+|------------------|------|-------------------------------------|
+| cipher_id        | 2    | 0x0001 = XChaCha20-Poly1305         |
+| kdf_id           | 2    | 0x0001 = Argon2id                   |
+| kdf_memory_kib   | 4    | Argon2id memory cost (KiB)          |
+| kdf_iterations   | 4    | Argon2id iterations                 |
+| kdf_parallelism  | 4    | Argon2id parallelism                |
+| salt_len         | 2    | Length of salt bytes                |
+| salt_bytes       | N    | Salt for Argon2id                   |
+| nonce_len        | 2    | Length of stream nonce bytes        |
+| nonce            | N    | Stream nonce (20 bytes for v3)      |
+| recipient_count  | 2    | Number of recipient entries         |
+| recipients       | N    | Repeated recipient entries          |
+
+Recipient entries:
+
+| Field              | Size | Description                         |
+|--------------------|------|-------------------------------------|
+| recipient_id       | 4    | Unique ID per recipient             |
+| recipient_type     | 2    | 0x0001 = Keyfile, 0x0002 = Password |
+| wrap_alg           | 2    | 0x0001 = XChaCha20-Poly1305         |
+| wrapped_key_len    | 4    | Length of wrapped key bytes         |
+| wrapped_key        | N    | Wrapped data key bytes              |
+
+Recipient metadata is authenticated as AAD during key wrapping.
+
 ## ChunkTable
 
 Each entry is 24 bytes. Entries MUST be sorted and contiguous by offset.
@@ -125,4 +156,4 @@ and should not be fully loaded into memory by default.
 
 - v0: checksum footer (CRC32) for tamper detection only
 - v1: fixed-length footer (no checksum) inside encrypted payload
-- v2: same as v1 (inside encrypted payload)
+- v2/v3: same as v1 (inside encrypted payload)

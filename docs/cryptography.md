@@ -1,8 +1,9 @@
 # Cryptography (Draft)
 
 Aegis uses a custom container format with standard, well-reviewed cryptographic
-primitives. This repository implements authenticated encryption for ACF v1+ and
-keeps the header in plaintext for compatibility and streaming.
+primitives. This repository implements authenticated encryption for ACF v1+,
+supports the v3 envelope model, and keeps the header in plaintext for
+compatibility and streaming.
 
 ## Primitives
 
@@ -24,6 +25,10 @@ Default v2 parameters are stored in the header and differ by mode:
 - Key file wrap: 64 MiB, 3 iterations, parallelism 1
 - Password wrap: 128 MiB, 4 iterations, parallelism 1
 
+Default v3 parameters are stored in the header and shared across all recipients.
+If any recipient is password-based, password defaults apply; otherwise key-file
+defaults apply.
+
 ## Key wrapping (v2)
 
 ACF v2 never encrypts payloads directly with a password. Instead:
@@ -39,11 +44,29 @@ streaming.
 Each container uses fresh random data keys, salts, and nonces to avoid
 password reuse across files.
 
+## Envelope model (v3)
+
+ACF v3 encrypts the payload once with a random data key, then wraps that data
+key for each recipient entry:
+
+1) A random data key encrypts the payload.
+2) A derived key (from password or key file) wraps the data key.
+3) The header stores a recipients table of wrapped keys, one per recipient.
+
+Recipient metadata (ID, type, wrap algorithm) is authenticated as AAD during
+key wrapping to prevent substitution or downgrade of recipient fields.
+
+## Recipient rotation
+
+Rotation updates the recipients list while preserving the data key and payload
+plaintext. The container is re-authenticated to bind the new header AAD to the
+existing encrypted payload.
+
 ## Password vs key file
 
 - Key files are high-entropy raw keys and should be preferred when possible.
 - Passwords are lower entropy and must be strong and unique per file.
-- Argon2id parameters for v2 are stored in the header to avoid ambiguity.
+- Argon2id parameters for v2/v3 are stored in the header to avoid ambiguity.
 
 ## Nonce and streaming
 
@@ -53,8 +76,9 @@ counter/flag to form the full 24-byte AEAD nonce for each chunk.
 
 ## Header authentication
 
-The ACF v1/v2 header is plaintext but authenticated as AEAD AAD. This protects
-cipher/KDF identifiers, salt, nonce, wrap metadata, and layout information.
+The ACF v1/v2/v3 header is plaintext but authenticated as AEAD AAD. This
+protects cipher/KDF identifiers, salt, nonce, recipient metadata, and layout
+information.
 
 ## Checksum vs. security
 
@@ -64,7 +88,7 @@ An attacker can craft collisions and bypass detection.
 
 ## Threat boundaries
 
-- ACF v1/v2 provides confidentiality and integrity of the encrypted payload.
+- ACF v1/v2/v3 provides confidentiality and integrity of the encrypted payload.
 - The header is authenticated but not encrypted.
 - Key files are never embedded in containers.
 
@@ -80,5 +104,6 @@ Key files are binary and contain raw symmetric key material only:
 ## Current status
 
 - No hardware-backed keys or secure elements.
-- No multi-recipient encryption.
+- Multi-recipient encryption is supported for v3.
+- Recipient rotation is supported without changing the data key.
 - No claims of being "unbreakable" or "perfectly secure".
