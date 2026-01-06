@@ -78,6 +78,8 @@ pub struct DecryptReader<R: Read> {
     reader: R,
     decryptor: Option<DecryptorLE31<XChaCha20Poly1305>>,
     aad: Vec<u8>,
+    // Reuse the ciphertext buffer to avoid per-chunk allocations.
+    cipher_buf: Vec<u8>,
     buffer: Zeroizing<Vec<u8>>,
     position: usize,
     done: bool,
@@ -96,6 +98,7 @@ impl<R: Read> DecryptReader<R> {
             reader,
             decryptor: Some(decryptor),
             aad: aad.to_vec(),
+            cipher_buf: vec![0u8; STREAM_CHUNK_SIZE + AEAD_TAG_LEN],
             buffer: Zeroizing::new(Vec::new()),
             position: 0,
             done: false,
@@ -130,7 +133,7 @@ impl<R: Read> DecryptReader<R> {
             return Ok(());
         }
 
-        let mut cipher_buf = vec![0u8; STREAM_CHUNK_SIZE + AEAD_TAG_LEN];
+        let cipher_buf = &mut self.cipher_buf;
         let mut read = 0usize;
 
         if let Some(byte) = self.lookahead.take() {
@@ -153,13 +156,11 @@ impl<R: Read> DecryptReader<R> {
             return Err(CryptoError::Truncated);
         }
 
-        cipher_buf.truncate(read);
-
-        if cipher_buf.len() < AEAD_TAG_LEN {
+        if read < AEAD_TAG_LEN {
             return Err(CryptoError::Truncated);
         }
 
-        let mut is_last = cipher_buf.len() < STREAM_CHUNK_SIZE + AEAD_TAG_LEN;
+        let mut is_last = read < STREAM_CHUNK_SIZE + AEAD_TAG_LEN;
         if !is_last {
             let mut probe = [0u8; 1];
             let n = self.reader.read(&mut probe)?;
@@ -169,12 +170,13 @@ impl<R: Read> DecryptReader<R> {
                 self.lookahead = Some(probe[0]);
             }
         }
+        let cipher_slice = &cipher_buf[..read];
         let plaintext = if is_last {
             self.done = true;
             let decryptor = self.decryptor.take().ok_or(CryptoError::Truncated)?;
             decryptor
                 .decrypt_last(Payload {
-                    msg: &cipher_buf,
+                    msg: cipher_slice,
                     aad: &self.aad,
                 })
                 .map_err(|_| CryptoError::AuthFailed)?
@@ -182,7 +184,7 @@ impl<R: Read> DecryptReader<R> {
             let decryptor = self.decryptor.as_mut().ok_or(CryptoError::Truncated)?;
             decryptor
                 .decrypt_next(Payload {
-                    msg: &cipher_buf,
+                    msg: cipher_slice,
                     aad: &self.aad,
                 })
                 .map_err(|_| CryptoError::AuthFailed)?

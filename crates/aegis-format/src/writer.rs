@@ -19,6 +19,9 @@ use crate::acf::{
 };
 use crate::validate::{validate_chunks, validate_header};
 
+// 64 KiB buffers align with AEAD chunking for better throughput.
+const IO_BUFFER_SIZE: usize = 64 * 1024;
+
 pub struct WriteChunkSource {
     pub chunk_id: u32,
     pub chunk_type: ChunkType,
@@ -594,7 +597,7 @@ fn copy_exact_with_checksum<R: Read, W: Write>(
     writer: &mut W,
     mut len: u64,
 ) -> io::Result<()> {
-    let mut buffer = [0u8; 8192];
+    let mut buffer = [0u8; IO_BUFFER_SIZE];
 
     while len > 0 {
         let to_read = std::cmp::min(len, buffer.len() as u64) as usize;

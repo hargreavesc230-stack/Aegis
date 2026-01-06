@@ -3,6 +3,9 @@
 Aegis uses a custom container format with standard, well-reviewed cryptographic
 primitives. No bespoke cryptography is introduced.
 
+This project has **not** undergone a formal external audit. See
+`docs/threat_model.md` for assumptions and attacker models.
+
 ## Primitives
 
 - AEAD: XChaCha20-Poly1305 (RustCrypto `chacha20poly1305`)

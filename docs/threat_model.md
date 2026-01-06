@@ -2,8 +2,8 @@
 
 ## Status
 
-Aegis targets production use for the supported container versions. No external audit
-has been performed yet.
+Aegis is in its initial public release. It has not been externally audited.
+Use it with caution and validate it against your threat model.
 
 ## Assets
 
@@ -40,6 +40,12 @@ has been performed yet.
 - PKI, certificate validation, or automated key distribution
 - Post-compromise secrecy or forward secrecy for stored containers
 - Hiding header metadata (headers remain plaintext)
+
+## Assumptions
+
+- The OS RNG is available and functioning correctly.
+- Users provide strong passwords for password-based recipients.
+- Private keys and key files are stored securely by the user.
 
 ## Mitigations
 

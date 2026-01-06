@@ -2,19 +2,16 @@
 
 ## Status
 
-Aegis is **not production-ready**. It is an evolving project with authenticated
-encryption, key files, password-based recipients, multi-recipient envelopes,
-and public-key recipients implemented, but it has not been externally audited.
-Do not use it to protect sensitive data.
+Aegis is in its initial public release and has **not** been externally audited.
+Evaluate it against your threat model before use and do not rely on it as your
+only line of defense for sensitive data.
 
 ## Reporting a vulnerability
 
-Please email security reports to:
+Preferred channel: GitHub Security Advisories (private reports).
 
-- (SOON)
-
-If you are unsure whether an issue is security-related, you may still report it
-through the same channel. Do not open public issues for vulnerabilities.
+If private advisories are unavailable, open a GitHub Issue and keep details
+high-level until maintainers respond.
 
 ## What to include
 

@@ -20,6 +20,9 @@ use crate::acf::{
 use crate::validate::{validate_chunks, validate_header};
 use crate::writer::{RecipientSpec, WrittenEncryptedContainer};
 
+// 64 KiB buffers improve streaming throughput while keeping memory bounded.
+const IO_BUFFER_SIZE: usize = 64 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct ParsedContainer {
     pub header: FileHeader,
@@ -51,14 +54,11 @@ pub fn read_header<R: Read>(reader: &mut R) -> Result<(FileHeader, Vec<u8>), For
         return Err(FormatError::HeaderTooLarge(header_len));
     }
 
-    let mut header_bytes = Vec::with_capacity(header_len);
-    header_bytes.extend_from_slice(&base);
+    let mut header_bytes = vec![0u8; header_len];
+    header_bytes[..HEADER_BASE_LEN].copy_from_slice(&base);
 
     if header_len > HEADER_BASE_LEN {
-        let remaining = header_len - HEADER_BASE_LEN;
-        let mut extra = vec![0u8; remaining];
-        read_exact_truncated(reader, &mut extra)?;
-        header_bytes.extend_from_slice(&extra);
+        read_exact_truncated(reader, &mut header_bytes[HEADER_BASE_LEN..])?;
     }
 
     let header = parse_header(&header_bytes)?;
@@ -1176,6 +1176,7 @@ fn select_data_key_v4(
     let mut has_candidate = false;
     let mut derived: Option<Zeroizing<Vec<u8>>> = None;
     let mut private_key = None;
+    let mut computed_pubkey = None;
 
     if recipient_type == WrapType::PublicKey {
         if key_material.len() != X25519_KEY_LEN {
@@ -1188,6 +1189,7 @@ fn select_data_key_v4(
         }
         let mut key_bytes = [0u8; X25519_KEY_LEN];
         key_bytes.copy_from_slice(key_material);
+        computed_pubkey = Some(public_key_from_private(&key_bytes));
         private_key = Some(key_bytes);
     }
 
@@ -1235,8 +1237,10 @@ fn select_data_key_v4(
                     .ephemeral_pubkey
                     .as_ref()
                     .ok_or(FormatError::MissingRecipientEphemeralKey)?;
-                let computed_pubkey = public_key_from_private(private_key);
-                if &computed_pubkey != recipient_pubkey {
+                let computed_pubkey = computed_pubkey
+                    .as_ref()
+                    .ok_or(FormatError::MissingRecipientKeyMaterial)?;
+                if computed_pubkey != recipient_pubkey {
                     continue;
                 }
                 let derived = derive_wrapping_key(private_key, ephemeral_pubkey)?;
@@ -1445,7 +1449,7 @@ fn skip_exact_update<R: Read>(
     mut len: u64,
     crc: &mut Crc32,
 ) -> Result<(), FormatError> {
-    let mut buffer = [0u8; 8192];
+    let mut buffer = [0u8; IO_BUFFER_SIZE];
 
     while len > 0 {
         let to_read = std::cmp::min(len, buffer.len() as u64) as usize;
@@ -1468,7 +1472,7 @@ fn copy_exact_update<R: Read, W: Write + ?Sized>(
     mut len: u64,
     crc: &mut Crc32,
 ) -> Result<(), FormatError> {
-    let mut buffer = [0u8; 8192];
+    let mut buffer = [0u8; IO_BUFFER_SIZE];
 
     while len > 0 {
         let to_read = std::cmp::min(len, buffer.len() as u64) as usize;
@@ -1491,7 +1495,7 @@ fn copy_exact_plaintext<R: Read, W: Write>(
     writer: &mut W,
     mut len: u64,
 ) -> Result<(), FormatError> {
-    let mut buffer = [0u8; 8192];
+    let mut buffer = [0u8; IO_BUFFER_SIZE];
 
     while len > 0 {
         let to_read = std::cmp::min(len, buffer.len() as u64) as usize;
@@ -1510,7 +1514,7 @@ fn skip_exact_plaintext<R: Read>(
     reader: &mut DecryptReader<R>,
     mut len: u64,
 ) -> Result<(), FormatError> {
-    let mut buffer = [0u8; 8192];
+    let mut buffer = [0u8; IO_BUFFER_SIZE];
 
     while len > 0 {
         let to_read = std::cmp::min(len, buffer.len() as u64) as usize;

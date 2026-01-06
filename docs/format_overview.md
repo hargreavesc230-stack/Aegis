@@ -24,6 +24,9 @@ for multi-recipient envelopes. v4 extends recipients with public-key entries.
 - ACF v1/v2 containers are never emitted by the CLI
 - Unknown versions: hard error, no best-effort parsing
 
+Inspect behavior: `aegis-cli inspect` reads the header and fails closed on
+unknown or malformed versions without attempting best-effort parsing.
+
 ### Stability guarantees
 
 - The on-disk layout for v0-v4 will not change silently.

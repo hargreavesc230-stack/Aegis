@@ -17,6 +17,16 @@ scripts\check.bat
 `scripts\check.bat` includes fuzz-lite and end-to-end CLI validation. If you
 touch container parsing or cryptography, run it before submitting.
 
+Rust 1.74 is required (see `Cargo.toml`).
+
+## Release build scripts
+
+- Windows: `scripts\build_release.bat`
+- Linux/macOS: `scripts/build_release.sh`
+
+The Windows script builds all rustup-installed targets and bundles outputs in
+`dist\bundle`.
+
 ## Guidelines
 
 - Keep changes small and reviewable.
