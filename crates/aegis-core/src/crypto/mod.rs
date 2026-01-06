@@ -7,6 +7,7 @@ pub mod aead;
 pub mod ids;
 pub mod kdf;
 pub mod keyfile;
+pub mod wrap;
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -24,6 +25,10 @@ pub enum CryptoError {
     InvalidKeyFileLength(u16),
     #[error("key file length too large: {0}")]
     KeyFileTooLarge(usize),
+    #[error("invalid wrapped key data")]
+    InvalidWrappedKey,
+    #[error("invalid wrap nonce length: expected {expected}, found {found}")]
+    InvalidWrapNonceLength { expected: usize, found: usize },
     #[error("argon2 error: {0}")]
     Argon2(argon2::Error),
     #[error("authentication failed")]

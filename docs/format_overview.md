@@ -1,8 +1,9 @@
-# Format Overview (ACF v0/v1)
+# Format Overview (ACF v0/v1/v2)
 
 Aegis Container Format (ACF) is a deterministic, streaming-first binary layout
 with strict parsing rules. v0 is unencrypted; v1 adds authenticated encryption
-(XChaCha20-Poly1305) while keeping the header in plaintext.
+(XChaCha20-Poly1305) while keeping the header in plaintext. v2 adds key wrapping
+so passwords never directly encrypt payloads.
 
 ## Global rules
 
@@ -21,7 +22,7 @@ with strict parsing rules. v0 is unencrypted; v1 adds authenticated encryption
 [ Footer ]
 ```
 
-For v1, the `ChunkTable`, `ChunkData`, and `Footer` are encrypted as a single
+For v1/v2, the `ChunkTable`, `ChunkData`, and `Footer` are encrypted as a single
 payload. Only the header is plaintext and authenticated as AAD.
 
 ## FileHeader (base, fixed-size)
@@ -62,6 +63,35 @@ The header is authenticated as AEAD AAD in v1.
 For v1 streaming, the stored nonce is 20 bytes. The STREAM construction
 appends a 4-byte counter/flag to form the 24-byte XChaCha20-Poly1305 nonce.
 
+## Header extensions (v2)
+
+v2 adds key wrapping and KDF parameters. The header stores:
+
+| Field            | Size | Description                         |
+|------------------|------|-------------------------------------|
+| cipher_id        | 2    | 0x0001 = XChaCha20-Poly1305         |
+| kdf_id           | 2    | 0x0001 = Argon2id                   |
+| kdf_memory_kib   | 4    | Argon2id memory cost (KiB)          |
+| kdf_iterations   | 4    | Argon2id iterations                 |
+| kdf_parallelism  | 4    | Argon2id parallelism                |
+| salt_len         | 2    | Length of salt bytes                |
+| salt_bytes       | N    | Salt for Argon2id                   |
+| nonce_len        | 2    | Length of stream nonce bytes        |
+| nonce            | N    | Stream nonce (20 bytes for v2)      |
+| wrap_type        | 2    | 0x0001 = Keyfile, 0x0002 = Password |
+| wrapped_key_len  | 2    | Length of wrapped key bytes         |
+| wrapped_key      | N    | Wrapped data key bytes              |
+
+Wrapped key bytes are encoded as:
+
+```
+u16 wrap_nonce_len
+u8  wrap_nonce[wrap_nonce_len]   (24 bytes for v2)
+u8  ciphertext[data_key_len + tag]
+```
+
+The header is authenticated as AEAD AAD in v2.
+
 ## ChunkTable
 
 Each entry is 24 bytes. Entries MUST be sorted and contiguous by offset.
@@ -95,3 +125,4 @@ and should not be fully loaded into memory by default.
 
 - v0: checksum footer (CRC32) for tamper detection only
 - v1: fixed-length footer (no checksum) inside encrypted payload
+- v2: same as v1 (inside encrypted payload)

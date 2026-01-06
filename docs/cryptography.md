@@ -1,7 +1,7 @@
 # Cryptography (Draft)
 
 Aegis uses a custom container format with standard, well-reviewed cryptographic
-primitives. This repository implements authenticated encryption for ACF v1 and
+primitives. This repository implements authenticated encryption for ACF v1+ and
 keeps the header in plaintext for compatibility and streaming.
 
 ## Primitives
@@ -19,6 +19,32 @@ Defaults are explicit and constant for v1:
 - Parallelism: 1
 - Output length: 32 bytes (AEAD key length)
 
+Default v2 parameters are stored in the header and differ by mode:
+
+- Key file wrap: 64 MiB, 3 iterations, parallelism 1
+- Password wrap: 128 MiB, 4 iterations, parallelism 1
+
+## Key wrapping (v2)
+
+ACF v2 never encrypts payloads directly with a password. Instead:
+
+1) A random data key encrypts the payload.
+2) A derived key (from password or key file) wraps the data key.
+3) The wrapped data key is stored in the header.
+
+The wrap uses XChaCha20-Poly1305 with a dedicated wrap nonce and an AAD
+context string. This is for key wrapping only and is independent of payload
+streaming.
+
+Each container uses fresh random data keys, salts, and nonces to avoid
+password reuse across files.
+
+## Password vs key file
+
+- Key files are high-entropy raw keys and should be preferred when possible.
+- Passwords are lower entropy and must be strong and unique per file.
+- Argon2id parameters for v2 are stored in the header to avoid ambiguity.
+
 ## Nonce and streaming
 
 ACF v1 uses the RustCrypto STREAM construction for XChaCha20-Poly1305.
@@ -27,8 +53,8 @@ counter/flag to form the full 24-byte AEAD nonce for each chunk.
 
 ## Header authentication
 
-The ACF v1 header is plaintext but authenticated as AEAD AAD. This protects
-cipher/KDF identifiers, salt, nonce, and layout metadata from tampering.
+The ACF v1/v2 header is plaintext but authenticated as AEAD AAD. This protects
+cipher/KDF identifiers, salt, nonce, wrap metadata, and layout information.
 
 ## Checksum vs. security
 
@@ -38,7 +64,7 @@ An attacker can craft collisions and bypass detection.
 
 ## Threat boundaries
 
-- ACF v1 provides confidentiality and integrity of the encrypted payload.
+- ACF v1/v2 provides confidentiality and integrity of the encrypted payload.
 - The header is authenticated but not encrypted.
 - Key files are never embedded in containers.
 

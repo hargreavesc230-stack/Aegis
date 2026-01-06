@@ -7,13 +7,16 @@ use std::path::{Path, PathBuf};
 use aegis_core::crypto::keyfile::{generate_key, read_keyfile, write_keyfile};
 use aegis_core::crypto::CryptoError;
 use aegis_format::{
-    decrypt_container, extract_data_chunk, read_container_with_status, read_header,
-    write_container, write_encrypted_container, ChunkType, FormatError, ParsedContainer,
+    decrypt_container, decrypt_container_v2, extract_data_chunk, read_container_with_status,
+    read_header, write_container, write_encrypted_container, write_encrypted_container_password,
+    ChunkType, CryptoHeader, FormatError, ParsedContainer, WrapType, ACF_VERSION_V2,
 };
 use clap::{Parser, Subcommand};
+use rpassword::prompt_password;
 use thiserror::Error;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroizing;
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_CLI: i32 = 2;
@@ -53,14 +56,18 @@ enum Commands {
         input: PathBuf,
         output: PathBuf,
         #[arg(long)]
-        key: PathBuf,
+        key: Option<PathBuf>,
+        #[arg(long)]
+        password: bool,
     },
     /// Decrypt a container payload
     Dec {
         input: PathBuf,
         output: PathBuf,
         #[arg(long)]
-        key: PathBuf,
+        key: Option<PathBuf>,
+        #[arg(long)]
+        password: bool,
     },
 }
 
@@ -72,6 +79,8 @@ enum CliError {
     Crypto(#[from] CryptoError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Cli(String),
 }
 
 fn main() {
@@ -99,8 +108,18 @@ fn run() -> i32 {
         } => cmd_pack(&input, &output, metadata.as_deref()),
         Commands::Unpack { input, output } => cmd_unpack(&input, &output),
         Commands::Keygen { output, force } => cmd_keygen(&output, force),
-        Commands::Enc { input, output, key } => cmd_enc(&input, &output, &key),
-        Commands::Dec { input, output, key } => cmd_dec(&input, &output, &key),
+        Commands::Enc {
+            input,
+            output,
+            key,
+            password,
+        } => cmd_enc(&input, &output, key.as_deref(), password),
+        Commands::Dec {
+            input,
+            output,
+            key,
+            password,
+        } => cmd_dec(&input, &output, key.as_deref(), password),
     };
 
     match result {
@@ -132,6 +151,7 @@ fn map_exit_code(err: &CliError) -> i32 {
         CliError::Io(_) => EXIT_IO,
         CliError::Format(FormatError::Crypto(_)) => EXIT_CRYPTO,
         CliError::Crypto(_) => EXIT_CRYPTO,
+        CliError::Cli(_) => EXIT_CLI,
         CliError::Format(_) => EXIT_FORMAT,
     }
 }
@@ -150,6 +170,8 @@ fn cmd_inspect(path: &Path) -> Result<(), CliError> {
         print_v0_details(&parsed);
     } else if header.version == aegis_format::ACF_VERSION_V1 {
         print_v1_details(&header);
+    } else if header.version == ACF_VERSION_V2 {
+        print_v2_details(&header);
     }
 
     Ok(())
@@ -216,15 +238,59 @@ fn cmd_keygen(output: &Path, force: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-fn cmd_enc(input: &Path, output: &Path, key_path: &Path) -> Result<(), CliError> {
+enum AuthMode<'a> {
+    Keyfile(&'a Path),
+    Password,
+}
+
+fn resolve_mode<'a>(key_path: Option<&'a Path>, password: bool) -> Result<AuthMode<'a>, CliError> {
+    match (key_path, password) {
+        (Some(path), false) => Ok(AuthMode::Keyfile(path)),
+        (None, true) => Ok(AuthMode::Password),
+        (Some(_), true) => Err(CliError::Cli(
+            "choose either --key or --password, not both".to_string(),
+        )),
+        (None, false) => Err(CliError::Cli("missing --key or --password".to_string())),
+    }
+}
+
+fn read_password(confirm: bool) -> Result<Zeroizing<Vec<u8>>, CliError> {
+    if let Ok(password) = std::env::var("AEGIS_PASSWORD") {
+        if confirm {
+            if let Ok(confirm_pw) = std::env::var("AEGIS_PASSWORD_CONFIRM") {
+                if confirm_pw != password {
+                    return Err(CliError::Cli("passwords do not match".to_string()));
+                }
+            }
+        }
+        return Ok(Zeroizing::new(password.into_bytes()));
+    }
+
+    let password = Zeroizing::new(prompt_password("Enter password: ")?);
+    if confirm {
+        let confirm_pw = Zeroizing::new(prompt_password("Confirm password: ")?);
+        if password.as_str() != confirm_pw.as_str() {
+            return Err(CliError::Cli("passwords do not match".to_string()));
+        }
+    }
+
+    Ok(Zeroizing::new(password.as_bytes().to_vec()))
+}
+
+fn cmd_enc(
+    input: &Path,
+    output: &Path,
+    key_path: Option<&Path>,
+    password: bool,
+) -> Result<(), CliError> {
+    let mode = resolve_mode(key_path, password)?;
+
     info!(
         input = %input.display(),
         output = %output.display(),
-        key = %key_path.display(),
         "encrypting container"
     );
 
-    let keyfile = read_keyfile(key_path)?;
     let input_len = std::fs::metadata(input)?.len();
     let input_file = File::open(input)?;
 
@@ -238,35 +304,153 @@ fn cmd_enc(input: &Path, output: &Path, key_path: &Path) -> Result<(), CliError>
 
     let tmp_path = temp_path_for(output);
     let mut output_file = File::create(&tmp_path)?;
-    let _written =
-        write_encrypted_container(&mut output_file, &mut chunks, keyfile.key.as_slice())?;
+
+    match mode {
+        AuthMode::Keyfile(path) => {
+            let keyfile = read_keyfile(path)?;
+            let _written =
+                write_encrypted_container(&mut output_file, &mut chunks, keyfile.key.as_slice())?;
+        }
+        AuthMode::Password => {
+            let password_bytes = read_password(true)?;
+            let _written = write_encrypted_container_password(
+                &mut output_file,
+                &mut chunks,
+                password_bytes.as_slice(),
+            )?;
+        }
+    }
 
     finalize_output(&tmp_path, output)?;
     Ok(())
 }
 
-fn cmd_dec(input: &Path, output: &Path, key_path: &Path) -> Result<(), CliError> {
-    info!(
-        input = %input.display(),
-        output = %output.display(),
-        key = %key_path.display(),
-        "decrypting container"
-    );
+fn cmd_dec(
+    input: &Path,
+    output: &Path,
+    key_path: Option<&Path>,
+    password: bool,
+) -> Result<(), CliError> {
+    let mut header_file = File::open(input)?;
+    let (header, _) = read_header(&mut header_file)?;
 
-    let keyfile = read_keyfile(key_path)?;
-    let mut input_file = File::open(input)?;
+    match header.version {
+        aegis_format::ACF_VERSION_V1 => {
+            if password {
+                return Err(CliError::Cli(
+                    "v1 containers require a key file, not a password".to_string(),
+                ));
+            }
+            let key_path = key_path
+                .ok_or_else(|| CliError::Cli("missing --key for v1 container".to_string()))?;
 
-    let tmp_path = temp_path_for(output);
-    let mut output_file = File::create(&tmp_path)?;
+            info!(
+                input = %input.display(),
+                output = %output.display(),
+                key = %key_path.display(),
+                "decrypting container"
+            );
 
-    let result = decrypt_container(&mut input_file, &mut output_file, keyfile.key.as_slice());
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp_path);
+            let keyfile = read_keyfile(key_path)?;
+            let mut input_file = File::open(input)?;
+
+            let tmp_path = temp_path_for(output);
+            let mut output_file = File::create(&tmp_path)?;
+
+            let result =
+                decrypt_container(&mut input_file, &mut output_file, keyfile.key.as_slice());
+            if result.is_err() {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            result?;
+
+            finalize_output(&tmp_path, output)?;
+            Ok(())
+        }
+        ACF_VERSION_V2 => {
+            let wrap_type = match header.crypto.as_ref() {
+                Some(CryptoHeader::V2 { wrap_type, .. }) => *wrap_type,
+                _ => return Err(CliError::Format(FormatError::MissingCryptoHeader)),
+            };
+
+            match wrap_type {
+                WrapType::Keyfile => {
+                    if password {
+                        return Err(CliError::Cli(
+                            "container expects a key file, not a password".to_string(),
+                        ));
+                    }
+                    let key_path = key_path.ok_or_else(|| {
+                        CliError::Cli("missing --key for keyfile container".to_string())
+                    })?;
+
+                    info!(
+                        input = %input.display(),
+                        output = %output.display(),
+                        key = %key_path.display(),
+                        "decrypting container"
+                    );
+
+                    let keyfile = read_keyfile(key_path)?;
+                    let mut input_file = File::open(input)?;
+
+                    let tmp_path = temp_path_for(output);
+                    let mut output_file = File::create(&tmp_path)?;
+
+                    let result = decrypt_container_v2(
+                        &mut input_file,
+                        &mut output_file,
+                        keyfile.key.as_slice(),
+                        WrapType::Keyfile,
+                    );
+                    if result.is_err() {
+                        let _ = std::fs::remove_file(&tmp_path);
+                    }
+                    result?;
+                    finalize_output(&tmp_path, output)?;
+                    Ok(())
+                }
+                WrapType::Password => {
+                    if key_path.is_some() {
+                        return Err(CliError::Cli(
+                            "container expects a password, not a key file".to_string(),
+                        ));
+                    }
+                    if !password {
+                        return Err(CliError::Cli(
+                            "missing --password for password container".to_string(),
+                        ));
+                    }
+
+                    info!(
+                        input = %input.display(),
+                        output = %output.display(),
+                        "decrypting container"
+                    );
+
+                    let password_bytes = read_password(false)?;
+                    let mut input_file = File::open(input)?;
+
+                    let tmp_path = temp_path_for(output);
+                    let mut output_file = File::create(&tmp_path)?;
+
+                    let result = decrypt_container_v2(
+                        &mut input_file,
+                        &mut output_file,
+                        password_bytes.as_slice(),
+                        WrapType::Password,
+                    );
+                    if result.is_err() {
+                        let _ = std::fs::remove_file(&tmp_path);
+                    }
+                    result?;
+                    finalize_output(&tmp_path, output)?;
+                    Ok(())
+                }
+            }
+        }
+        other => Err(CliError::Format(FormatError::UnsupportedVersion(other))),
     }
-    result?;
-
-    finalize_output(&tmp_path, output)?;
-    Ok(())
 }
 
 fn temp_path_for(output: &Path) -> PathBuf {
@@ -319,13 +503,47 @@ fn print_v0_details(parsed: &ParsedContainer) {
 
 fn print_v1_details(header: &aegis_format::FileHeader) {
     println!("Encryption:");
-    if let Some(crypto) = header.crypto.as_ref() {
-        println!("  Cipher: {:?}", crypto.cipher_id);
-        println!("  KDF: {:?}", crypto.kdf_id);
-        println!("  Salt length: {} bytes", crypto.salt.len());
-        println!("  Nonce length: {} bytes", crypto.nonce.len());
+    if let Some(CryptoHeader::V1 {
+        cipher_id,
+        kdf_id,
+        salt,
+        nonce,
+    }) = header.crypto.as_ref()
+    {
+        println!("  Cipher: {:?}", cipher_id);
+        println!("  KDF: {:?}", kdf_id);
+        println!("  Salt length: {} bytes", salt.len());
+        println!("  Nonce length: {} bytes", nonce.len());
         println!("  Payload: encrypted");
-    } else {
-        println!("  Missing crypto header");
+        return;
     }
+    println!("  Missing crypto header");
+}
+
+fn print_v2_details(header: &aegis_format::FileHeader) {
+    println!("Encryption (v2):");
+    if let Some(CryptoHeader::V2 {
+        cipher_id,
+        kdf_id,
+        kdf_params,
+        salt,
+        nonce,
+        wrap_type,
+        wrapped_key,
+    }) = header.crypto.as_ref()
+    {
+        println!("  Cipher: {:?}", cipher_id);
+        println!("  KDF: {:?}", kdf_id);
+        println!(
+            "  KDF params: mem={} KiB, iterations={}, parallelism={}",
+            kdf_params.memory_kib, kdf_params.iterations, kdf_params.parallelism
+        );
+        println!("  Salt length: {} bytes", salt.len());
+        println!("  Nonce length: {} bytes", nonce.len());
+        println!("  Wrap type: {:?}", wrap_type);
+        println!("  Wrapped key length: {} bytes", wrapped_key.len());
+        println!("  Payload: encrypted");
+        return;
+    }
+    println!("  Missing crypto header");
 }

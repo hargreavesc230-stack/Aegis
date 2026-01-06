@@ -7,7 +7,7 @@ not been externally audited.
 
 ## Assets
 
-- Confidentiality of container payloads (ACF v1)
+- Confidentiality of container payloads (ACF v1/v2)
 - Integrity of container metadata and payloads
 - Availability of the CLI tools and container processing
 
@@ -16,6 +16,7 @@ not been externally audited.
 - Local attacker with read/write access to containers
 - Remote attacker who can provide crafted container files
 - Malware or untrusted software on the same host
+- Offline attacker attempting password brute-force
 
 ## Trust boundaries
 
@@ -35,6 +36,7 @@ not been externally audited.
 - Truncate containers to remove trailing data
 - Reorder or overlap chunks to confuse parsers
 - Substitute ciphertext to induce decryption failures
+- Exhaustively guess weak passwords against captured containers
 
 ## Goals
 
@@ -42,6 +44,7 @@ not been externally audited.
 - Provide clear, structured errors without panics
 - Maintain strict bounds checks on all binary parsing
 - Ensure AEAD authentication fails cleanly on tampering
+- Make offline guessing costly via Argon2id parameters
 
 ## Non-goals (current)
 
@@ -51,6 +54,7 @@ not been externally audited.
 
 ## Mitigations (planned)
 
-- Authenticated encryption with standard primitives (ACF v1)
+- Authenticated encryption with standard primitives (ACF v1/v2)
+- Key wrapping for password-based encryption (ACF v2)
 - Domain-separated metadata and payload integrity
 - Explicit versioning and format negotiation

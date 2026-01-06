@@ -1,8 +1,9 @@
 use std::io::Cursor;
 
 use aegis_format::{
-    decrypt_container, read_header, write_encrypted_container, ChunkType, FormatError,
-    WriteChunkSource, ACF_VERSION_V1, HEADER_BASE_LEN,
+    decrypt_container_v2, read_header, write_encrypted_container,
+    write_encrypted_container_password, ChunkType, CryptoHeader, FormatError, WrapType,
+    WriteChunkSource, ACF_VERSION_V2, HEADER_BASE_LEN,
 };
 use aegis_testkit::{flip_byte, sample_bytes};
 
@@ -17,7 +18,7 @@ fn make_chunk(chunk_id: u32, chunk_type: ChunkType, data: Vec<u8>) -> WriteChunk
 }
 
 #[test]
-fn encrypted_roundtrip_small() {
+fn encrypted_roundtrip_small_keyfile() {
     let key = vec![0x11u8; 32];
     let data = sample_bytes(128);
     let mut chunks = vec![make_chunk(1, ChunkType::Data, data.clone())];
@@ -26,13 +27,19 @@ fn encrypted_roundtrip_small() {
     write_encrypted_container(&mut container, &mut chunks, &key).expect("encrypt");
 
     let mut output = Vec::new();
-    decrypt_container(&mut Cursor::new(container), &mut output, &key).expect("decrypt");
+    decrypt_container_v2(
+        &mut Cursor::new(container),
+        &mut output,
+        &key,
+        WrapType::Keyfile,
+    )
+    .expect("decrypt");
 
     assert_eq!(output, data);
 }
 
 #[test]
-fn encrypted_roundtrip_large() {
+fn encrypted_roundtrip_large_keyfile() {
     let key = vec![0x22u8; 32];
     let data = sample_bytes(2 * 1024 * 1024);
     let mut chunks = vec![make_chunk(1, ChunkType::Data, data.clone())];
@@ -41,7 +48,34 @@ fn encrypted_roundtrip_large() {
     write_encrypted_container(&mut container, &mut chunks, &key).expect("encrypt");
 
     let mut output = Vec::new();
-    decrypt_container(&mut Cursor::new(container), &mut output, &key).expect("decrypt");
+    decrypt_container_v2(
+        &mut Cursor::new(container),
+        &mut output,
+        &key,
+        WrapType::Keyfile,
+    )
+    .expect("decrypt");
+
+    assert_eq!(output, data);
+}
+
+#[test]
+fn encrypted_roundtrip_password() {
+    let password = b"mock-password";
+    let data = sample_bytes(512);
+    let mut chunks = vec![make_chunk(1, ChunkType::Data, data.clone())];
+
+    let mut container = Vec::new();
+    write_encrypted_container_password(&mut container, &mut chunks, password).expect("encrypt");
+
+    let mut output = Vec::new();
+    decrypt_container_v2(
+        &mut Cursor::new(container),
+        &mut output,
+        password,
+        WrapType::Password,
+    )
+    .expect("decrypt");
 
     assert_eq!(output, data);
 }
@@ -56,32 +90,58 @@ fn wrong_key_rejected() {
     let mut container = Vec::new();
     write_encrypted_container(&mut container, &mut chunks, &key).expect("encrypt");
 
-    let err = decrypt_container(&mut Cursor::new(container), &mut Vec::new(), &wrong_key)
-        .expect_err("wrong key should fail");
+    let err = decrypt_container_v2(
+        &mut Cursor::new(container),
+        &mut Vec::new(),
+        &wrong_key,
+        WrapType::Keyfile,
+    )
+    .expect_err("wrong key should fail");
     assert!(matches!(err, FormatError::Crypto(_)));
 }
 
 #[test]
-fn corrupted_ciphertext_rejected() {
-    let key = vec![0x55u8; 32];
+fn wrong_password_rejected() {
+    let password = b"correct-password";
+    let wrong_password = b"wrong-password";
     let data = sample_bytes(256);
     let mut chunks = vec![make_chunk(1, ChunkType::Data, data)];
 
     let mut container = Vec::new();
-    write_encrypted_container(&mut container, &mut chunks, &key).expect("encrypt");
+    write_encrypted_container_password(&mut container, &mut chunks, password).expect("encrypt");
 
-    let (header, _) = read_header(&mut Cursor::new(&container)).expect("header");
-    assert_eq!(header.version, ACF_VERSION_V1);
-    let offset = header.header_len as usize + 4;
-    flip_byte(&mut container, offset);
-
-    let err = decrypt_container(&mut Cursor::new(container), &mut Vec::new(), &key)
-        .expect_err("corruption should fail");
+    let err = decrypt_container_v2(
+        &mut Cursor::new(container),
+        &mut Vec::new(),
+        wrong_password,
+        WrapType::Password,
+    )
+    .expect_err("wrong password should fail");
     assert!(matches!(err, FormatError::Crypto(_)));
 }
 
 #[test]
-fn header_tampering_rejected() {
+fn mixed_mode_rejected() {
+    let key = vec![0x55u8; 32];
+    let password = b"mixed-mode";
+    let data = sample_bytes(256);
+    let mut chunks = vec![make_chunk(1, ChunkType::Data, data.clone())];
+
+    let mut container = Vec::new();
+    write_encrypted_container_password(&mut container, &mut chunks, password).expect("encrypt");
+
+    let err = decrypt_container_v2(
+        &mut Cursor::new(container),
+        &mut Vec::new(),
+        &key,
+        WrapType::Keyfile,
+    )
+    .expect_err("wrong wrap mode should fail");
+    assert!(matches!(err, FormatError::WrapTypeMismatch));
+}
+
+#[test]
+fn corrupted_ciphertext_rejected() {
     let key = vec![0x66u8; 32];
     let data = sample_bytes(256);
     let mut chunks = vec![make_chunk(1, ChunkType::Data, data)];
@@ -90,18 +150,47 @@ fn header_tampering_rejected() {
     write_encrypted_container(&mut container, &mut chunks, &key).expect("encrypt");
 
     let (header, _) = read_header(&mut Cursor::new(&container)).expect("header");
-    let salt_offset = HEADER_BASE_LEN + 2 + 2 + 2;
+    assert_eq!(header.version, ACF_VERSION_V2);
+    let offset = header.header_len as usize + 4;
+    flip_byte(&mut container, offset);
+
+    let err = decrypt_container_v2(
+        &mut Cursor::new(container),
+        &mut Vec::new(),
+        &key,
+        WrapType::Keyfile,
+    )
+    .expect_err("corruption should fail");
+    assert!(matches!(err, FormatError::Crypto(_)));
+}
+
+#[test]
+fn header_tampering_rejected() {
+    let key = vec![0x77u8; 32];
+    let data = sample_bytes(256);
+    let mut chunks = vec![make_chunk(1, ChunkType::Data, data)];
+
+    let mut container = Vec::new();
+    write_encrypted_container(&mut container, &mut chunks, &key).expect("encrypt");
+
+    let (header, _) = read_header(&mut Cursor::new(&container)).expect("header");
+    let salt_offset = HEADER_BASE_LEN + 2 + 2 + 4 + 4 + 4 + 2;
     assert!(salt_offset < header.header_len as usize);
     flip_byte(&mut container, salt_offset);
 
-    let err = decrypt_container(&mut Cursor::new(container), &mut Vec::new(), &key)
-        .expect_err("tampered header should fail");
+    let err = decrypt_container_v2(
+        &mut Cursor::new(container),
+        &mut Vec::new(),
+        &key,
+        WrapType::Keyfile,
+    )
+    .expect_err("tampered header should fail");
     assert!(matches!(err, FormatError::Crypto(_)));
 }
 
 #[test]
 fn truncated_ciphertext_rejected() {
-    let key = vec![0x77u8; 32];
+    let key = vec![0x88u8; 32];
     let data = sample_bytes(256);
     let mut chunks = vec![make_chunk(1, ChunkType::Data, data)];
 
@@ -110,8 +199,13 @@ fn truncated_ciphertext_rejected() {
 
     container.truncate(container.len() - 1);
 
-    let err = decrypt_container(&mut Cursor::new(container), &mut Vec::new(), &key)
-        .expect_err("truncated should fail");
+    let err = decrypt_container_v2(
+        &mut Cursor::new(container),
+        &mut Vec::new(),
+        &key,
+        WrapType::Keyfile,
+    )
+    .expect_err("truncated should fail");
     assert!(matches!(
         err,
         FormatError::Crypto(_) | FormatError::Truncated
@@ -120,7 +214,7 @@ fn truncated_ciphertext_rejected() {
 
 #[test]
 fn nonce_uniqueness() {
-    let key = vec![0x88u8; 32];
+    let key = vec![0x99u8; 32];
     let data = sample_bytes(64);
 
     let mut chunks_a = vec![make_chunk(1, ChunkType::Data, data.clone())];
@@ -134,8 +228,14 @@ fn nonce_uniqueness() {
     let (header_a, _) = read_header(&mut Cursor::new(&container_a)).expect("header a");
     let (header_b, _) = read_header(&mut Cursor::new(&container_b)).expect("header b");
 
-    let nonce_a = header_a.crypto.as_ref().expect("crypto a").nonce.clone();
-    let nonce_b = header_b.crypto.as_ref().expect("crypto b").nonce.clone();
+    let nonce_a = match header_a.crypto.as_ref().expect("crypto a") {
+        CryptoHeader::V2 { nonce, .. } => nonce.clone(),
+        _ => panic!("expected v2 header"),
+    };
+    let nonce_b = match header_b.crypto.as_ref().expect("crypto b") {
+        CryptoHeader::V2 { nonce, .. } => nonce.clone(),
+        _ => panic!("expected v2 header"),
+    };
 
     assert_ne!(nonce_a, nonce_b);
 }

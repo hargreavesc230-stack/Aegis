@@ -4,6 +4,7 @@ members = [
     "crates/aegis-format",
     "crates/aegis-cli",
     "crates/aegis-testkit",
+    "crates/aegis-fuzzlite",
 ]
 resolver = "2"
 
@@ -21,3 +22,4 @@ zeroize = "1.7.0"
 argon2 = "0.5.3"
 chacha20poly1305 = { version = "0.10.1", features = ["stream"] }
 rand_core = "0.6.4"
+rpassword = "7.3.1"

@@ -9,6 +9,7 @@ pub const FOOTER_MAGIC: [u8; 4] = *b"AEGF";
 
 pub const ACF_VERSION_V0: u16 = 0;
 pub const ACF_VERSION_V1: u16 = 1;
+pub const ACF_VERSION_V2: u16 = 2;
 
 pub const HEADER_BASE_LEN: usize = 36;
 pub const HEADER_BASE_LEN_U16: u16 = 36;
@@ -18,6 +19,8 @@ pub const CHUNK_LEN_U16: u16 = 24;
 
 pub const FOOTER_V1_LEN: u32 = 12;
 pub const MAX_HEADER_LEN: usize = 4096;
+pub const MAX_CHUNK_COUNT: u32 = 1_000_000;
+pub const MAX_WRAPPED_KEY_LEN: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkType {
@@ -67,12 +70,59 @@ impl TryFrom<u16> for ChecksumType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapType {
+    Keyfile = 0x0001,
+    Password = 0x0002,
+}
+
+impl TryFrom<u16> for WrapType {
+    type Error = FormatError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0x0001 => Ok(WrapType::Keyfile),
+            0x0002 => Ok(WrapType::Password),
+            other => Err(FormatError::UnsupportedWrapType(other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KdfParamsHeader {
+    pub memory_kib: u32,
+    pub iterations: u32,
+    pub parallelism: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CryptoHeader {
+pub struct V2HeaderParams {
     pub cipher_id: CipherId,
     pub kdf_id: KdfId,
+    pub kdf_params: KdfParamsHeader,
     pub salt: Vec<u8>,
     pub nonce: Vec<u8>,
+    pub wrap_type: WrapType,
+    pub wrapped_key: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CryptoHeader {
+    V1 {
+        cipher_id: CipherId,
+        kdf_id: KdfId,
+        salt: Vec<u8>,
+        nonce: Vec<u8>,
+    },
+    V2 {
+        cipher_id: CipherId,
+        kdf_id: KdfId,
+        kdf_params: KdfParamsHeader,
+        salt: Vec<u8>,
+        nonce: Vec<u8>,
+        wrap_type: WrapType,
+        wrapped_key: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,11 +165,36 @@ impl FileHeader {
             chunk_count,
             chunk_table_offset: header_len as u64,
             footer_offset,
-            crypto: Some(CryptoHeader {
+            crypto: Some(CryptoHeader::V1 {
                 cipher_id,
                 kdf_id,
                 salt,
                 nonce,
+            }),
+        })
+    }
+
+    pub fn new_v2(
+        chunk_count: u32,
+        footer_offset: u64,
+        params: V2HeaderParams,
+    ) -> Result<Self, FormatError> {
+        let header_len = header_len_v2(&params.salt, &params.nonce, &params.wrapped_key)?;
+        Ok(Self {
+            version: ACF_VERSION_V2,
+            header_len,
+            flags: 0,
+            chunk_count,
+            chunk_table_offset: header_len as u64,
+            footer_offset,
+            crypto: Some(CryptoHeader::V2 {
+                cipher_id: params.cipher_id,
+                kdf_id: params.kdf_id,
+                kdf_params: params.kdf_params,
+                salt: params.salt,
+                nonce: params.nonce,
+                wrap_type: params.wrap_type,
+                wrapped_key: params.wrapped_key,
             }),
         })
     }
@@ -221,6 +296,10 @@ pub enum FormatError {
     InvalidFooterMagic { found: [u8; 4] },
     #[error("unsupported checksum type: {0}")]
     UnsupportedChecksumType(u16),
+    #[error("unsupported wrap type: {0}")]
+    UnsupportedWrapType(u16),
+    #[error("wrap type mismatch")]
+    WrapTypeMismatch,
     #[error("invalid footer length: {found}, expected {expected}")]
     InvalidFooterLength { found: u32, expected: u32 },
     #[error("invalid checksum length: {found}, expected {expected}")]
@@ -229,6 +308,14 @@ pub enum FormatError {
     InvalidSaltLength(u16),
     #[error("invalid nonce length: {0}")]
     InvalidNonceLength(u16),
+    #[error("invalid wrapped key length: {0}")]
+    InvalidWrappedKeyLength(u16),
+    #[error("invalid kdf memory cost: {0}")]
+    InvalidKdfMemory(u32),
+    #[error("invalid kdf iterations: {0}")]
+    InvalidKdfIterations(u32),
+    #[error("invalid kdf parallelism: {0}")]
+    InvalidKdfParallelism(u32),
     #[error("missing crypto header")]
     MissingCryptoHeader,
     #[error("checksum mismatch: expected {expected:#010X}, found {found:#010X}")]
@@ -257,16 +344,71 @@ pub fn header_len_v1(salt: &[u8], nonce: &[u8]) -> Result<u16, FormatError> {
     Ok(total as u16)
 }
 
+pub fn header_len_v2(salt: &[u8], nonce: &[u8], wrapped_key: &[u8]) -> Result<u16, FormatError> {
+    if salt.is_empty() {
+        return Err(FormatError::InvalidSaltLength(0));
+    }
+    if nonce.is_empty() {
+        return Err(FormatError::InvalidNonceLength(0));
+    }
+    if wrapped_key.is_empty() {
+        return Err(FormatError::InvalidWrappedKeyLength(0));
+    }
+
+    let salt_len = u16::try_from(salt.len()).map_err(|_| FormatError::InvalidSaltLength(0))?;
+    let nonce_len = u16::try_from(nonce.len()).map_err(|_| FormatError::InvalidNonceLength(0))?;
+    let wrapped_len =
+        u16::try_from(wrapped_key.len()).map_err(|_| FormatError::InvalidWrappedKeyLength(0))?;
+
+    if wrapped_key.len() > MAX_WRAPPED_KEY_LEN {
+        return Err(FormatError::InvalidWrappedKeyLength(wrapped_len));
+    }
+
+    let total = HEADER_BASE_LEN
+        + 2
+        + 2
+        + 4
+        + 4
+        + 4
+        + 2
+        + salt_len as usize
+        + 2
+        + nonce_len as usize
+        + 2
+        + 2
+        + wrapped_len as usize;
+
+    if total > MAX_HEADER_LEN {
+        return Err(FormatError::HeaderTooLarge(total));
+    }
+
+    Ok(total as u16)
+}
+
 pub fn encode_header(header: &FileHeader) -> Result<Vec<u8>, FormatError> {
     let expected_len = match header.version {
         ACF_VERSION_V0 => HEADER_BASE_LEN_U16,
-        ACF_VERSION_V1 => {
-            let crypto = header
-                .crypto
-                .as_ref()
-                .ok_or(FormatError::MissingCryptoHeader)?;
-            header_len_v1(&crypto.salt, &crypto.nonce)?
-        }
+        ACF_VERSION_V1 => match header
+            .crypto
+            .as_ref()
+            .ok_or(FormatError::MissingCryptoHeader)?
+        {
+            CryptoHeader::V1 { salt, nonce, .. } => header_len_v1(salt, nonce)?,
+            _ => return Err(FormatError::MissingCryptoHeader),
+        },
+        ACF_VERSION_V2 => match header
+            .crypto
+            .as_ref()
+            .ok_or(FormatError::MissingCryptoHeader)?
+        {
+            CryptoHeader::V2 {
+                salt,
+                nonce,
+                wrapped_key,
+                ..
+            } => header_len_v2(salt, nonce, wrapped_key)?,
+            _ => return Err(FormatError::MissingCryptoHeader),
+        },
         other => return Err(FormatError::UnsupportedVersion(other)),
     };
 
@@ -287,24 +429,86 @@ pub fn encode_header(header: &FileHeader) -> Result<Vec<u8>, FormatError> {
     buf.extend_from_slice(&header.chunk_table_offset.to_le_bytes());
     buf.extend_from_slice(&header.footer_offset.to_le_bytes());
 
-    if header.version == ACF_VERSION_V1 {
-        let crypto = header
-            .crypto
-            .as_ref()
-            .ok_or(FormatError::MissingCryptoHeader)?;
-        let cipher_id = crypto.cipher_id as u16;
-        let kdf_id = crypto.kdf_id as u16;
-        let salt_len =
-            u16::try_from(crypto.salt.len()).map_err(|_| FormatError::InvalidSaltLength(0))?;
-        let nonce_len =
-            u16::try_from(crypto.nonce.len()).map_err(|_| FormatError::InvalidNonceLength(0))?;
+    match header.version {
+        ACF_VERSION_V1 => {
+            let crypto = header
+                .crypto
+                .as_ref()
+                .ok_or(FormatError::MissingCryptoHeader)?;
+            let (cipher_id, kdf_id, salt, nonce) = match crypto {
+                CryptoHeader::V1 {
+                    cipher_id,
+                    kdf_id,
+                    salt,
+                    nonce,
+                } => (cipher_id, kdf_id, salt, nonce),
+                _ => return Err(FormatError::MissingCryptoHeader),
+            };
 
-        buf.extend_from_slice(&cipher_id.to_le_bytes());
-        buf.extend_from_slice(&kdf_id.to_le_bytes());
-        buf.extend_from_slice(&salt_len.to_le_bytes());
-        buf.extend_from_slice(&crypto.salt);
-        buf.extend_from_slice(&nonce_len.to_le_bytes());
-        buf.extend_from_slice(&crypto.nonce);
+            let cipher_id = *cipher_id as u16;
+            let kdf_id = *kdf_id as u16;
+            let salt_len =
+                u16::try_from(salt.len()).map_err(|_| FormatError::InvalidSaltLength(0))?;
+            let nonce_len =
+                u16::try_from(nonce.len()).map_err(|_| FormatError::InvalidNonceLength(0))?;
+
+            buf.extend_from_slice(&cipher_id.to_le_bytes());
+            buf.extend_from_slice(&kdf_id.to_le_bytes());
+            buf.extend_from_slice(&salt_len.to_le_bytes());
+            buf.extend_from_slice(salt);
+            buf.extend_from_slice(&nonce_len.to_le_bytes());
+            buf.extend_from_slice(nonce);
+        }
+        ACF_VERSION_V2 => {
+            let crypto = header
+                .crypto
+                .as_ref()
+                .ok_or(FormatError::MissingCryptoHeader)?;
+            let (cipher_id, kdf_id, kdf_params, salt, nonce, wrap_type, wrapped_key) = match crypto
+            {
+                CryptoHeader::V2 {
+                    cipher_id,
+                    kdf_id,
+                    kdf_params,
+                    salt,
+                    nonce,
+                    wrap_type,
+                    wrapped_key,
+                } => (
+                    cipher_id,
+                    kdf_id,
+                    kdf_params,
+                    salt,
+                    nonce,
+                    wrap_type,
+                    wrapped_key,
+                ),
+                _ => return Err(FormatError::MissingCryptoHeader),
+            };
+
+            let cipher_id = *cipher_id as u16;
+            let kdf_id = *kdf_id as u16;
+            let salt_len =
+                u16::try_from(salt.len()).map_err(|_| FormatError::InvalidSaltLength(0))?;
+            let nonce_len =
+                u16::try_from(nonce.len()).map_err(|_| FormatError::InvalidNonceLength(0))?;
+            let wrapped_len = u16::try_from(wrapped_key.len())
+                .map_err(|_| FormatError::InvalidWrappedKeyLength(0))?;
+
+            buf.extend_from_slice(&cipher_id.to_le_bytes());
+            buf.extend_from_slice(&kdf_id.to_le_bytes());
+            buf.extend_from_slice(&kdf_params.memory_kib.to_le_bytes());
+            buf.extend_from_slice(&kdf_params.iterations.to_le_bytes());
+            buf.extend_from_slice(&kdf_params.parallelism.to_le_bytes());
+            buf.extend_from_slice(&salt_len.to_le_bytes());
+            buf.extend_from_slice(salt);
+            buf.extend_from_slice(&nonce_len.to_le_bytes());
+            buf.extend_from_slice(nonce);
+            buf.extend_from_slice(&(*wrap_type as u16).to_le_bytes());
+            buf.extend_from_slice(&wrapped_len.to_le_bytes());
+            buf.extend_from_slice(wrapped_key);
+        }
+        _ => {}
     }
 
     Ok(buf)
@@ -404,11 +608,131 @@ pub fn parse_header(buf: &[u8]) -> Result<FileHeader, FormatError> {
         let cipher_id = CipherId::try_from(cipher_id_raw)?;
         let kdf_id = KdfId::try_from(kdf_id_raw)?;
 
-        crypto = Some(CryptoHeader {
+        crypto = Some(CryptoHeader::V1 {
             cipher_id,
             kdf_id,
             salt,
             nonce,
+        });
+    } else if version == ACF_VERSION_V2 {
+        if header_len as usize > MAX_HEADER_LEN {
+            return Err(FormatError::HeaderTooLarge(header_len as usize));
+        }
+
+        if buf.len() != header_len as usize {
+            return Err(FormatError::InvalidHeaderLength {
+                found: header_len,
+                expected: buf.len() as u16,
+            });
+        }
+
+        let mut cursor = HEADER_BASE_LEN;
+        if buf.len() < cursor + 2 + 2 + 4 + 4 + 4 + 2 + 2 + 2 + 2 {
+            return Err(FormatError::Truncated);
+        }
+
+        let cipher_id_raw = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]);
+        cursor += 2;
+        let kdf_id_raw = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]);
+        cursor += 2;
+        let memory_kib = u32::from_le_bytes([
+            buf[cursor],
+            buf[cursor + 1],
+            buf[cursor + 2],
+            buf[cursor + 3],
+        ]);
+        cursor += 4;
+        let iterations = u32::from_le_bytes([
+            buf[cursor],
+            buf[cursor + 1],
+            buf[cursor + 2],
+            buf[cursor + 3],
+        ]);
+        cursor += 4;
+        let parallelism = u32::from_le_bytes([
+            buf[cursor],
+            buf[cursor + 1],
+            buf[cursor + 2],
+            buf[cursor + 3],
+        ]);
+        cursor += 4;
+
+        let salt_len = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]);
+        cursor += 2;
+        if salt_len == 0 {
+            return Err(FormatError::InvalidSaltLength(0));
+        }
+
+        let salt_end = cursor + salt_len as usize;
+        if salt_end > buf.len() {
+            return Err(FormatError::Truncated);
+        }
+        let salt = buf[cursor..salt_end].to_vec();
+        cursor = salt_end;
+
+        if cursor + 2 > buf.len() {
+            return Err(FormatError::Truncated);
+        }
+        let nonce_len = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]);
+        cursor += 2;
+        if nonce_len == 0 {
+            return Err(FormatError::InvalidNonceLength(0));
+        }
+
+        let nonce_end = cursor + nonce_len as usize;
+        if nonce_end > buf.len() {
+            return Err(FormatError::Truncated);
+        }
+        let nonce = buf[cursor..nonce_end].to_vec();
+        cursor = nonce_end;
+
+        if cursor + 2 + 2 > buf.len() {
+            return Err(FormatError::Truncated);
+        }
+
+        let wrap_type_raw = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]);
+        cursor += 2;
+        let wrapped_len = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]);
+        cursor += 2;
+
+        if wrapped_len == 0 {
+            return Err(FormatError::InvalidWrappedKeyLength(0));
+        }
+
+        if wrapped_len as usize > MAX_WRAPPED_KEY_LEN {
+            return Err(FormatError::InvalidWrappedKeyLength(wrapped_len));
+        }
+
+        let wrapped_end = cursor + wrapped_len as usize;
+        if wrapped_end > buf.len() {
+            return Err(FormatError::Truncated);
+        }
+        let wrapped_key = buf[cursor..wrapped_end].to_vec();
+        cursor = wrapped_end;
+
+        if cursor != buf.len() {
+            return Err(FormatError::InvalidHeaderLength {
+                found: header_len,
+                expected: cursor as u16,
+            });
+        }
+
+        let cipher_id = CipherId::try_from(cipher_id_raw)?;
+        let kdf_id = KdfId::try_from(kdf_id_raw)?;
+        let wrap_type = WrapType::try_from(wrap_type_raw)?;
+
+        crypto = Some(CryptoHeader::V2 {
+            cipher_id,
+            kdf_id,
+            kdf_params: KdfParamsHeader {
+                memory_kib,
+                iterations,
+                parallelism,
+            },
+            salt,
+            nonce,
+            wrap_type,
+            wrapped_key,
         });
     } else {
         return Err(FormatError::UnsupportedVersion(version));

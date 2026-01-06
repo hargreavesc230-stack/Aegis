@@ -1,14 +1,15 @@
 use std::io::{self, Read, Write};
 
 use aegis_core::crypto::aead::DecryptReader;
-use aegis_core::crypto::kdf::{derive_key, KdfParams};
+use aegis_core::crypto::kdf::KdfParams;
+use aegis_core::crypto::wrap::unwrap_key;
 use aegis_core::io_ext::read_exact_or_err;
 use aegis_core::Crc32;
 
 use crate::acf::{
-    parse_header, ChecksumType, ChunkEntry, ChunkType, FileHeader, FooterV0, FooterV1, FormatError,
-    ACF_VERSION_V0, ACF_VERSION_V1, CHUNK_LEN, FOOTER_MAGIC, FOOTER_V1_LEN, HEADER_BASE_LEN,
-    MAX_HEADER_LEN,
+    parse_header, ChecksumType, ChunkEntry, ChunkType, CryptoHeader, FileHeader, FooterV0,
+    FooterV1, FormatError, WrapType, ACF_VERSION_V0, ACF_VERSION_V1, ACF_VERSION_V2, CHUNK_LEN,
+    FOOTER_MAGIC, FOOTER_V1_LEN, HEADER_BASE_LEN, MAX_HEADER_LEN,
 };
 use crate::validate::{validate_chunks, validate_header};
 
@@ -83,14 +84,133 @@ pub fn decrypt_container<R: Read, W: Write>(
     }
     validate_header(&header)?;
 
-    let crypto = header
+    let (salt, nonce) = match header
         .crypto
         .as_ref()
-        .ok_or(FormatError::MissingCryptoHeader)?;
-    let derived = derive_key(key_material, &crypto.salt, KdfParams::default())?;
+        .ok_or(FormatError::MissingCryptoHeader)?
+    {
+        CryptoHeader::V1 { salt, nonce, .. } => (salt, nonce),
+        _ => return Err(FormatError::MissingCryptoHeader),
+    };
 
-    let mut decrypt_reader =
-        DecryptReader::new(reader, derived.as_slice(), &crypto.nonce, &header_bytes)?;
+    let derived = aegis_core::crypto::kdf::derive_key(key_material, salt, KdfParams::default())?;
+
+    let mut decrypt_reader = DecryptReader::new(reader, derived.as_slice(), nonce, &header_bytes)?;
+
+    let mut chunks = Vec::with_capacity(header.chunk_count as usize);
+    for _ in 0..header.chunk_count {
+        let mut entry_buf = [0u8; CHUNK_LEN];
+        read_exact_plaintext(&mut decrypt_reader, &mut entry_buf)?;
+
+        let chunk_id = u32::from_le_bytes([entry_buf[0], entry_buf[1], entry_buf[2], entry_buf[3]]);
+        let chunk_type_raw = u16::from_le_bytes([entry_buf[4], entry_buf[5]]);
+        let flags = u16::from_le_bytes([entry_buf[6], entry_buf[7]]);
+        let offset = u64::from_le_bytes([
+            entry_buf[8],
+            entry_buf[9],
+            entry_buf[10],
+            entry_buf[11],
+            entry_buf[12],
+            entry_buf[13],
+            entry_buf[14],
+            entry_buf[15],
+        ]);
+        let length = u64::from_le_bytes([
+            entry_buf[16],
+            entry_buf[17],
+            entry_buf[18],
+            entry_buf[19],
+            entry_buf[20],
+            entry_buf[21],
+            entry_buf[22],
+            entry_buf[23],
+        ]);
+
+        let chunk_type = ChunkType::try_from(chunk_type_raw)?;
+
+        chunks.push(ChunkEntry {
+            chunk_id,
+            chunk_type,
+            flags,
+            offset,
+            length,
+        });
+    }
+
+    let _data_start = validate_chunks(&header, &chunks)?;
+
+    let mut data_chunk_seen = false;
+    for chunk in &chunks {
+        if chunk.chunk_type == ChunkType::Data {
+            if data_chunk_seen {
+                return Err(FormatError::MultipleDataChunks);
+            }
+            data_chunk_seen = true;
+            if chunk.length > 0 {
+                copy_exact_plaintext(&mut decrypt_reader, writer, chunk.length)?;
+            }
+        } else if chunk.length > 0 {
+            skip_exact_plaintext(&mut decrypt_reader, chunk.length)?;
+        }
+    }
+
+    if !data_chunk_seen {
+        return Err(FormatError::MissingDataChunk);
+    }
+
+    let footer = read_footer_v1(&mut decrypt_reader)?;
+    ensure_plaintext_eof(&mut decrypt_reader)?;
+
+    Ok(DecryptedContainer {
+        header,
+        chunks,
+        footer,
+    })
+}
+
+pub fn decrypt_container_v2<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    key_material: &[u8],
+    wrap_type: WrapType,
+) -> Result<DecryptedContainer, FormatError> {
+    let (header, header_bytes) = read_header(reader)?;
+    if header.version != ACF_VERSION_V2 {
+        return Err(FormatError::UnsupportedVersion(header.version));
+    }
+    validate_header(&header)?;
+
+    let (kdf_params, salt, nonce, header_wrap_type, wrapped_key) = match header
+        .crypto
+        .as_ref()
+        .ok_or(FormatError::MissingCryptoHeader)?
+    {
+        CryptoHeader::V2 {
+            kdf_params,
+            salt,
+            nonce,
+            wrap_type,
+            wrapped_key,
+            ..
+        } => (kdf_params, salt, nonce, *wrap_type, wrapped_key),
+        _ => return Err(FormatError::MissingCryptoHeader),
+    };
+
+    if header_wrap_type != wrap_type {
+        return Err(FormatError::WrapTypeMismatch);
+    }
+
+    let kdf_params = KdfParams {
+        memory_kib: kdf_params.memory_kib,
+        iterations: kdf_params.iterations,
+        parallelism: kdf_params.parallelism,
+        output_len: aegis_core::crypto::aead::AEAD_KEY_LEN,
+    };
+
+    let derived = aegis_core::crypto::kdf::derive_key(key_material, salt, kdf_params)?;
+    let data_key = unwrap_key(derived.as_slice(), wrapped_key)?;
+
+    let mut decrypt_reader = DecryptReader::new(reader, data_key.as_slice(), nonce, &header_bytes)?;
 
     let mut chunks = Vec::with_capacity(header.chunk_count as usize);
     for _ in 0..header.chunk_count {

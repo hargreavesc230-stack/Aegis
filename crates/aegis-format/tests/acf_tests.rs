@@ -1,8 +1,13 @@
 use std::io::{self, Cursor, Read, Write};
 
+use aegis_core::crypto::ids::{CipherId, KdfId};
+use aegis_core::crypto::kdf::{DEFAULT_KEYFILE_PARAMS, KDF_MEMORY_KIB_MAX};
+use aegis_format::acf::encode_header;
+use aegis_format::validate::validate_header;
 use aegis_format::{
-    read_container, read_container_with_status, write_container, ChunkType, FormatError,
-    WriteChunkSource, CHUNK_LEN, HEADER_BASE_LEN,
+    read_container, read_container_with_status, write_container, ChunkType, CryptoHeader,
+    FileHeader, FormatError, KdfParamsHeader, WrapType, WriteChunkSource, CHUNK_LEN,
+    HEADER_BASE_LEN, MAX_WRAPPED_KEY_LEN,
 };
 use aegis_testkit::{flip_byte, sample_bytes};
 
@@ -122,6 +127,92 @@ fn checksum_status_for_inspect() {
 
     let parsed = read_container_with_status(&mut Cursor::new(bytes)).expect("inspect read");
     assert!(!parsed.checksum_valid);
+}
+
+#[test]
+fn fuzz_regression_invalid_wrap_type() {
+    let header = FileHeader::new_v2(
+        1,
+        0,
+        aegis_format::V2HeaderParams {
+            cipher_id: CipherId::XChaCha20Poly1305,
+            kdf_id: KdfId::Argon2id,
+            kdf_params: KdfParamsHeader {
+                memory_kib: DEFAULT_KEYFILE_PARAMS.memory_kib,
+                iterations: DEFAULT_KEYFILE_PARAMS.iterations,
+                parallelism: DEFAULT_KEYFILE_PARAMS.parallelism,
+            },
+            salt: vec![0x11u8; 16],
+            nonce: vec![0x22u8; 20],
+            wrap_type: WrapType::Keyfile,
+            wrapped_key: vec![0x33u8; 64],
+        },
+    )
+    .expect("header");
+
+    let mut bytes = encode_header(&header).expect("encode");
+    let wrap_offset = HEADER_BASE_LEN + 2 + 2 + 4 + 4 + 4 + 2 + 16 + 2 + 20;
+    bytes[wrap_offset] = 0xEE;
+    bytes[wrap_offset + 1] = 0xEE;
+
+    let err = aegis_format::read_header(&mut Cursor::new(bytes)).unwrap_err();
+    assert!(matches!(err, FormatError::UnsupportedWrapType(_)));
+}
+
+#[test]
+fn excessive_kdf_params_rejected() {
+    let header = FileHeader::new_v2(
+        1,
+        0,
+        aegis_format::V2HeaderParams {
+            cipher_id: CipherId::XChaCha20Poly1305,
+            kdf_id: KdfId::Argon2id,
+            kdf_params: KdfParamsHeader {
+                memory_kib: KDF_MEMORY_KIB_MAX + 1,
+                iterations: DEFAULT_KEYFILE_PARAMS.iterations,
+                parallelism: DEFAULT_KEYFILE_PARAMS.parallelism,
+            },
+            salt: vec![0x11u8; 16],
+            nonce: vec![0x22u8; 20],
+            wrap_type: WrapType::Keyfile,
+            wrapped_key: vec![0x33u8; 64],
+        },
+    )
+    .expect("header");
+
+    let err = validate_header(&header).unwrap_err();
+    assert!(matches!(err, FormatError::InvalidKdfMemory(_)));
+}
+
+#[test]
+fn wrapped_key_length_rejected() {
+    let mut header = FileHeader::new_v2(
+        1,
+        0,
+        aegis_format::V2HeaderParams {
+            cipher_id: CipherId::XChaCha20Poly1305,
+            kdf_id: KdfId::Argon2id,
+            kdf_params: KdfParamsHeader {
+                memory_kib: DEFAULT_KEYFILE_PARAMS.memory_kib,
+                iterations: DEFAULT_KEYFILE_PARAMS.iterations,
+                parallelism: DEFAULT_KEYFILE_PARAMS.parallelism,
+            },
+            salt: vec![0x11u8; 16],
+            nonce: vec![0x22u8; 20],
+            wrap_type: WrapType::Keyfile,
+            wrapped_key: vec![0x33u8; 64],
+        },
+    )
+    .expect("header");
+
+    if let Some(CryptoHeader::V2 { wrapped_key, .. }) = header.crypto.as_mut() {
+        *wrapped_key = vec![0x33u8; MAX_WRAPPED_KEY_LEN + 1];
+    } else {
+        panic!("expected v2 crypto header");
+    }
+
+    let err = validate_header(&header).unwrap_err();
+    assert!(matches!(err, FormatError::InvalidWrappedKeyLength(_)));
 }
 
 struct ZeroReader {

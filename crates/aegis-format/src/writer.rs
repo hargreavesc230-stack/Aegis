@@ -1,13 +1,19 @@
 use std::io::{self, Read, Write};
 
-use aegis_core::crypto::aead::{encrypt_stream, generate_nonce};
+use aegis_core::crypto::aead::{encrypt_stream, generate_nonce, AEAD_KEY_LEN};
 use aegis_core::crypto::ids::{CipherId, KdfId};
-use aegis_core::crypto::kdf::{derive_key, generate_salt, KdfParams, DEFAULT_SALT_LEN};
+use aegis_core::crypto::kdf::{
+    derive_key, generate_salt, KdfParams, DEFAULT_KEYFILE_PARAMS, DEFAULT_PASSWORD_PARAMS,
+    DEFAULT_SALT_LEN,
+};
+use aegis_core::crypto::keyfile::generate_key;
+use aegis_core::crypto::wrap::wrap_key;
 use aegis_core::Crc32;
 
 use crate::acf::{
     encode_chunk_entry, encode_footer_v0, encode_footer_v1, encode_header, ChunkEntry, ChunkType,
-    FileHeader, FooterV0, FooterV1, FormatError, CHUNK_LEN, HEADER_BASE_LEN,
+    FileHeader, FooterV0, FooterV1, FormatError, WrapType, CHUNK_LEN, HEADER_BASE_LEN,
+    MAX_CHUNK_COUNT,
 };
 use crate::validate::{validate_chunks, validate_header};
 
@@ -37,7 +43,7 @@ pub fn write_container<W: Write>(
     writer: &mut W,
     chunks: &mut [WriteChunkSource],
 ) -> Result<WrittenContainer, FormatError> {
-    if chunks.len() > u32::MAX as usize {
+    if chunks.len() > MAX_CHUNK_COUNT as usize {
         return Err(FormatError::ChunkCountTooLarge);
     }
 
@@ -111,15 +117,51 @@ pub fn write_encrypted_container<W: Write>(
     chunks: &mut [WriteChunkSource],
     key_material: &[u8],
 ) -> Result<WrittenEncryptedContainer, FormatError> {
-    if chunks.len() > u32::MAX as usize {
+    write_encrypted_container_v2(
+        writer,
+        chunks,
+        key_material,
+        WrapType::Keyfile,
+        DEFAULT_KEYFILE_PARAMS,
+    )
+}
+
+pub fn write_encrypted_container_password<W: Write>(
+    writer: &mut W,
+    chunks: &mut [WriteChunkSource],
+    password: &[u8],
+) -> Result<WrittenEncryptedContainer, FormatError> {
+    write_encrypted_container_v2(
+        writer,
+        chunks,
+        password,
+        WrapType::Password,
+        DEFAULT_PASSWORD_PARAMS,
+    )
+}
+
+pub fn write_encrypted_container_v2<W: Write>(
+    writer: &mut W,
+    chunks: &mut [WriteChunkSource],
+    key_material: &[u8],
+    wrap_type: WrapType,
+    kdf_params: KdfParams,
+) -> Result<WrittenEncryptedContainer, FormatError> {
+    if chunks.len() > MAX_CHUNK_COUNT as usize {
         return Err(FormatError::ChunkCountTooLarge);
     }
 
     let chunk_count = chunks.len() as u32;
     let salt = generate_salt(DEFAULT_SALT_LEN)?;
     let nonce = generate_nonce()?;
+    let data_key = generate_key(AEAD_KEY_LEN)?;
 
-    let header_len = crate::acf::header_len_v1(&salt, &nonce)? as u64;
+    let wrapped_key = {
+        let derived = derive_key(key_material, &salt, kdf_params)?;
+        wrap_key(derived.as_slice(), data_key.as_slice())?
+    };
+
+    let header_len = crate::acf::header_len_v2(&salt, &nonce, &wrapped_key)? as u64;
     let table_len = (chunk_count as u64)
         .checked_mul(CHUNK_LEN as u64)
         .ok_or(FormatError::ChunkCountTooLarge)?;
@@ -152,13 +194,22 @@ pub fn write_encrypted_container<W: Write>(
     let footer = FooterV1::new();
     let footer_offset = offset;
 
-    let header = FileHeader::new_v1(
+    let header = FileHeader::new_v2(
         chunk_count,
         footer_offset,
-        CipherId::XChaCha20Poly1305,
-        KdfId::Argon2id,
-        salt.to_vec(),
-        nonce.to_vec(),
+        crate::acf::V2HeaderParams {
+            cipher_id: CipherId::XChaCha20Poly1305,
+            kdf_id: KdfId::Argon2id,
+            kdf_params: crate::acf::KdfParamsHeader {
+                memory_kib: kdf_params.memory_kib,
+                iterations: kdf_params.iterations,
+                parallelism: kdf_params.parallelism,
+            },
+            salt: salt.to_vec(),
+            nonce: nonce.to_vec(),
+            wrap_type,
+            wrapped_key,
+        },
     )?;
 
     validate_header(&header)?;
@@ -174,12 +225,11 @@ pub fn write_encrypted_container<W: Write>(
 
     let footer_bytes = encode_footer_v1(&footer);
 
-    let derived = derive_key(key_material, &salt, KdfParams::default())?;
     let mut payload = PayloadReader::new(&table_bytes, chunks, &footer_bytes);
     encrypt_stream(
         &mut payload,
         writer,
-        derived.as_slice(),
+        data_key.as_slice(),
         &nonce,
         &header_bytes,
     )?;

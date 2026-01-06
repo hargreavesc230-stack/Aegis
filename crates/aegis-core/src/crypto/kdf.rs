@@ -13,15 +13,30 @@ pub struct KdfParams {
 }
 
 pub const DEFAULT_SALT_LEN: usize = 16;
+pub const KDF_MEMORY_KIB_MIN: u32 = 64 * 1024;
+pub const KDF_MEMORY_KIB_MAX: u32 = 1024 * 1024;
+pub const KDF_ITERATIONS_MIN: u32 = 3;
+pub const KDF_ITERATIONS_MAX: u32 = 10;
+pub const KDF_PARALLELISM_MIN: u32 = 1;
+pub const KDF_PARALLELISM_MAX: u32 = 8;
+
+pub const DEFAULT_KEYFILE_PARAMS: KdfParams = KdfParams {
+    memory_kib: KDF_MEMORY_KIB_MIN,
+    iterations: KDF_ITERATIONS_MIN,
+    parallelism: 1,
+    output_len: 32,
+};
+
+pub const DEFAULT_PASSWORD_PARAMS: KdfParams = KdfParams {
+    memory_kib: 128 * 1024,
+    iterations: 4,
+    parallelism: 1,
+    output_len: 32,
+};
 
 impl Default for KdfParams {
     fn default() -> Self {
-        Self {
-            memory_kib: 64 * 1024,
-            iterations: 3,
-            parallelism: 1,
-            output_len: 32,
-        }
+        DEFAULT_KEYFILE_PARAMS
     }
 }
 
