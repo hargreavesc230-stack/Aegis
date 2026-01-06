@@ -20,7 +20,7 @@ use aegis_format::{
 use clap::{Parser, Subcommand};
 use rpassword::prompt_password;
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
@@ -48,9 +48,16 @@ enum Commands {
         output: PathBuf,
         #[arg(long)]
         metadata: Option<PathBuf>,
+        #[arg(long)]
+        force: bool,
     },
     /// Unpack the data chunk from a v0 container
-    Unpack { input: PathBuf, output: PathBuf },
+    Unpack {
+        input: PathBuf,
+        output: PathBuf,
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate a new key file
     Keygen {
         #[arg(value_name = "PATH")]
@@ -72,6 +79,10 @@ enum Commands {
         recipient_pubkeys: Vec<PathBuf>,
         #[arg(long = "recipient-password", alias = "password")]
         recipient_password: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long = "allow-mixed-recipients")]
+        allow_mixed_recipients: bool,
     },
     /// Decrypt a container payload
     Dec {
@@ -91,6 +102,10 @@ enum Commands {
         input: PathBuf,
         #[arg(long)]
         output: PathBuf,
+        #[arg(long)]
+        force: bool,
+        #[arg(long = "allow-mixed-recipients")]
+        allow_mixed_recipients: bool,
         #[arg(long = "auth-key", value_name = "PATH")]
         auth_key: Option<PathBuf>,
         #[arg(long = "auth-private-key", value_name = "PATH")]
@@ -131,7 +146,13 @@ fn run() -> i32 {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
-            let _ = err.print();
+            if err.exit_code() == 0 {
+                let _ = err.print();
+                return EXIT_SUCCESS;
+            }
+            let message = err.to_string();
+            let line = message.lines().next().unwrap_or("error: invalid arguments");
+            eprintln!("{line}");
             return EXIT_CLI;
         }
     };
@@ -142,8 +163,13 @@ fn run() -> i32 {
             input,
             output,
             metadata,
-        } => cmd_pack(&input, &output, metadata.as_deref()),
-        Commands::Unpack { input, output } => cmd_unpack(&input, &output),
+            force,
+        } => cmd_pack(&input, &output, metadata.as_deref(), force),
+        Commands::Unpack {
+            input,
+            output,
+            force,
+        } => cmd_unpack(&input, &output, force),
         Commands::Keygen {
             output,
             force,
@@ -161,12 +187,16 @@ fn run() -> i32 {
             recipient_keys,
             recipient_pubkeys,
             recipient_password,
+            force,
+            allow_mixed_recipients,
         } => cmd_enc(
             &input,
             &output,
             &recipient_keys,
             &recipient_pubkeys,
             recipient_password,
+            force,
+            allow_mixed_recipients,
         ),
         Commands::Dec {
             input,
@@ -185,6 +215,8 @@ fn run() -> i32 {
         Commands::Rotate {
             input,
             output,
+            force,
+            allow_mixed_recipients,
             auth_key,
             auth_private_key,
             auth_password,
@@ -195,6 +227,8 @@ fn run() -> i32 {
         } => cmd_rotate(RotateArgs {
             input: &input,
             output: &output,
+            force,
+            allow_mixed_recipients,
             auth_key: auth_key.as_deref(),
             auth_private_key: auth_private_key.as_deref(),
             auth_password,
@@ -215,7 +249,7 @@ fn run() -> i32 {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -224,7 +258,6 @@ fn init_tracing() {
 }
 
 fn report_error(err: &CliError) {
-    error!(error = %err, "command failed");
     eprintln!("error: {err}");
 }
 
@@ -264,7 +297,13 @@ fn cmd_inspect(path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-fn cmd_pack(input: &Path, output: &Path, metadata: Option<&Path>) -> Result<(), CliError> {
+fn cmd_pack(
+    input: &Path,
+    output: &Path,
+    metadata: Option<&Path>,
+    force: bool,
+) -> Result<(), CliError> {
+    ensure_output_path(output, force)?;
     info!(
         input = %input.display(),
         output = %output.display(),
@@ -295,13 +334,21 @@ fn cmd_pack(input: &Path, output: &Path, metadata: Option<&Path>) -> Result<(), 
         });
     }
 
-    let mut output_file = File::create(output)?;
-    let _written = write_container(&mut output_file, &mut chunks)?;
+    let tmp_path = prepare_temp_output(output)?;
+    let mut output_file = File::create(&tmp_path)?;
+
+    let result = write_container(&mut output_file, &mut chunks);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    let _written = result?;
+    finalize_output(&tmp_path, output, force)?;
 
     Ok(())
 }
 
-fn cmd_unpack(input: &Path, output: &Path) -> Result<(), CliError> {
+fn cmd_unpack(input: &Path, output: &Path, force: bool) -> Result<(), CliError> {
+    ensure_output_path(output, force)?;
     info!(
         input = %input.display(),
         output = %output.display(),
@@ -309,9 +356,15 @@ fn cmd_unpack(input: &Path, output: &Path) -> Result<(), CliError> {
     );
 
     let mut input_file = File::open(input)?;
-    let mut output_file = File::create(output)?;
+    let tmp_path = prepare_temp_output(output)?;
+    let mut output_file = File::create(&tmp_path)?;
 
-    let _parsed = extract_data_chunk(&mut input_file, &mut output_file)?;
+    let result = extract_data_chunk(&mut input_file, &mut output_file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    let _parsed = result?;
+    finalize_output(&tmp_path, output, force)?;
 
     Ok(())
 }
@@ -327,6 +380,8 @@ fn cmd_keygen(
             "use either key file output or --public/--private, not both".to_string(),
         )),
         (_, Some(pub_path), Some(priv_path)) => {
+            ensure_output_path(pub_path, force)?;
+            ensure_output_path(priv_path, force)?;
             info!(
                 public = %pub_path.display(),
                 private = %priv_path.display(),
@@ -341,6 +396,7 @@ fn cmd_keygen(
             "both --public and --private are required for keypair generation".to_string(),
         )),
         (Some(out_path), None, None) => {
+            ensure_output_path(out_path, force)?;
             info!(output = %out_path.display(), "generating key file");
             let key = generate_key(KEY_LEN)?;
             write_keyfile(out_path, key.as_slice(), force)?;
@@ -424,12 +480,30 @@ fn cmd_enc(
     recipient_keys: &[PathBuf],
     recipient_pubkeys: &[PathBuf],
     recipient_password: bool,
+    force: bool,
+    allow_mixed_recipients: bool,
 ) -> Result<(), CliError> {
     if recipient_keys.is_empty() && recipient_pubkeys.is_empty() && !recipient_password {
         return Err(CliError::Cli(
             "missing --recipient-key, --recipient-pubkey, or --recipient-password".to_string(),
         ));
     }
+    let mut recipient_types = 0u8;
+    if !recipient_keys.is_empty() {
+        recipient_types += 1;
+    }
+    if !recipient_pubkeys.is_empty() {
+        recipient_types += 1;
+    }
+    if recipient_password {
+        recipient_types += 1;
+    }
+    if recipient_types > 1 && !allow_mixed_recipients {
+        return Err(CliError::Cli(
+            "multiple recipient types require --allow-mixed-recipients".to_string(),
+        ));
+    }
+    ensure_output_path(output, force)?;
 
     info!(
         input = %input.display(),
@@ -493,7 +567,7 @@ fn cmd_enc(
         next_id = next_id.saturating_add(1);
     }
 
-    let tmp_path = temp_path_for(output);
+    let tmp_path = prepare_temp_output(output)?;
     let mut output_file = File::create(&tmp_path)?;
 
     if recipient_pubkeys.is_empty() {
@@ -502,7 +576,7 @@ fn cmd_enc(
         let _written = write_encrypted_container_v4(&mut output_file, &mut chunks, &recipients)?;
     }
 
-    finalize_output(&tmp_path, output)?;
+    finalize_output(&tmp_path, output, force)?;
     Ok(())
 }
 
@@ -561,6 +635,8 @@ fn cmd_list_recipients(input: &Path) -> Result<(), CliError> {
 struct RotateArgs<'a> {
     input: &'a Path,
     output: &'a Path,
+    force: bool,
+    allow_mixed_recipients: bool,
     auth_key: Option<&'a Path>,
     auth_private_key: Option<&'a Path>,
     auth_password: bool,
@@ -574,6 +650,8 @@ fn cmd_rotate(args: RotateArgs<'_>) -> Result<(), CliError> {
     let RotateArgs {
         input,
         output,
+        force,
+        allow_mixed_recipients,
         auth_key,
         auth_private_key,
         auth_password,
@@ -591,6 +669,22 @@ fn cmd_rotate(args: RotateArgs<'_>) -> Result<(), CliError> {
             "rotation requires add/remove recipient options".to_string(),
         ));
     }
+    let mut add_types = 0u8;
+    if !add_recipient_keys.is_empty() {
+        add_types += 1;
+    }
+    if !add_recipient_pubkeys.is_empty() {
+        add_types += 1;
+    }
+    if add_recipient_password {
+        add_types += 1;
+    }
+    if add_types > 1 && !allow_mixed_recipients {
+        return Err(CliError::Cli(
+            "multiple recipient types require --allow-mixed-recipients".to_string(),
+        ));
+    }
+    ensure_output_path(output, force)?;
 
     let mut header_file = File::open(input)?;
     let (header, _) = read_header(&mut header_file)?;
@@ -682,7 +776,7 @@ fn cmd_rotate(args: RotateArgs<'_>) -> Result<(), CliError> {
                 "rotating recipients"
             );
 
-            let tmp_path = temp_path_for(output);
+            let tmp_path = prepare_temp_output(output)?;
             let mut output_file = File::create(&tmp_path)?;
             let mut input_file = File::open(input)?;
 
@@ -699,7 +793,7 @@ fn cmd_rotate(args: RotateArgs<'_>) -> Result<(), CliError> {
             }
             result?;
 
-            finalize_output(&tmp_path, output)?;
+            finalize_output(&tmp_path, output, force)?;
             Ok(())
         }
         ACF_VERSION_V4 => {
@@ -803,7 +897,7 @@ fn cmd_rotate(args: RotateArgs<'_>) -> Result<(), CliError> {
                 "rotating recipients"
             );
 
-            let tmp_path = temp_path_for(output);
+            let tmp_path = prepare_temp_output(output)?;
             let mut output_file = File::create(&tmp_path)?;
             let mut input_file = File::open(input)?;
 
@@ -820,7 +914,7 @@ fn cmd_rotate(args: RotateArgs<'_>) -> Result<(), CliError> {
             }
             result?;
 
-            finalize_output(&tmp_path, output)?;
+            finalize_output(&tmp_path, output, force)?;
             Ok(())
         }
         _ => Err(CliError::Cli(
@@ -836,6 +930,7 @@ fn cmd_dec(
     private_key: Option<&Path>,
     recipient_password: bool,
 ) -> Result<(), CliError> {
+    ensure_output_path(output, false)?;
     let mut header_file = File::open(input)?;
     let (header, _) = read_header(&mut header_file)?;
 
@@ -860,7 +955,7 @@ fn cmd_dec(
             let keyfile = read_keyfile(key_path)?;
             let mut input_file = File::open(input)?;
 
-            let tmp_path = temp_path_for(output);
+            let tmp_path = prepare_temp_output(output)?;
             let mut output_file = File::create(&tmp_path)?;
 
             let result =
@@ -870,7 +965,7 @@ fn cmd_dec(
             }
             result?;
 
-            finalize_output(&tmp_path, output)?;
+            finalize_output(&tmp_path, output, false)?;
             Ok(())
         }
         ACF_VERSION_V2 => {
@@ -901,7 +996,7 @@ fn cmd_dec(
                     let keyfile = read_keyfile(key_path)?;
                     let mut input_file = File::open(input)?;
 
-                    let tmp_path = temp_path_for(output);
+                    let tmp_path = prepare_temp_output(output)?;
                     let mut output_file = File::create(&tmp_path)?;
 
                     let result = decrypt_container_v2(
@@ -914,7 +1009,7 @@ fn cmd_dec(
                         let _ = std::fs::remove_file(&tmp_path);
                     }
                     result?;
-                    finalize_output(&tmp_path, output)?;
+                    finalize_output(&tmp_path, output, false)?;
                     Ok(())
                 }
                 WrapType::Password => {
@@ -939,7 +1034,7 @@ fn cmd_dec(
                     let password_bytes = read_password(false)?;
                     let mut input_file = File::open(input)?;
 
-                    let tmp_path = temp_path_for(output);
+                    let tmp_path = prepare_temp_output(output)?;
                     let mut output_file = File::create(&tmp_path)?;
 
                     let result = decrypt_container_v2(
@@ -952,7 +1047,7 @@ fn cmd_dec(
                         let _ = std::fs::remove_file(&tmp_path);
                     }
                     result?;
-                    finalize_output(&tmp_path, output)?;
+                    finalize_output(&tmp_path, output, false)?;
                     Ok(())
                 }
                 WrapType::PublicKey => Err(CliError::Cli(
@@ -998,7 +1093,7 @@ fn cmd_dec(
                     let keyfile = read_keyfile(key_path)?;
                     let mut input_file = File::open(input)?;
 
-                    let tmp_path = temp_path_for(output);
+                    let tmp_path = prepare_temp_output(output)?;
                     let mut output_file = File::create(&tmp_path)?;
 
                     let result = decrypt_container_v3(
@@ -1011,7 +1106,7 @@ fn cmd_dec(
                         let _ = std::fs::remove_file(&tmp_path);
                     }
                     result?;
-                    finalize_output(&tmp_path, output)?;
+                    finalize_output(&tmp_path, output, false)?;
                     Ok(())
                 }
                 AuthMode::Password => {
@@ -1030,7 +1125,7 @@ fn cmd_dec(
                     let password_bytes = read_password(false)?;
                     let mut input_file = File::open(input)?;
 
-                    let tmp_path = temp_path_for(output);
+                    let tmp_path = prepare_temp_output(output)?;
                     let mut output_file = File::create(&tmp_path)?;
 
                     let result = decrypt_container_v3(
@@ -1043,7 +1138,7 @@ fn cmd_dec(
                         let _ = std::fs::remove_file(&tmp_path);
                     }
                     result?;
-                    finalize_output(&tmp_path, output)?;
+                    finalize_output(&tmp_path, output, false)?;
                     Ok(())
                 }
                 AuthMode::PrivateKey(_) => Err(CliError::Cli(
@@ -1088,7 +1183,7 @@ fn cmd_dec(
                     let keyfile = read_keyfile(key_path)?;
                     let mut input_file = File::open(input)?;
 
-                    let tmp_path = temp_path_for(output);
+                    let tmp_path = prepare_temp_output(output)?;
                     let mut output_file = File::create(&tmp_path)?;
 
                     let result = decrypt_container_v4(
@@ -1101,7 +1196,7 @@ fn cmd_dec(
                         let _ = std::fs::remove_file(&tmp_path);
                     }
                     result?;
-                    finalize_output(&tmp_path, output)?;
+                    finalize_output(&tmp_path, output, false)?;
                     Ok(())
                 }
                 AuthMode::Password => {
@@ -1121,7 +1216,7 @@ fn cmd_dec(
                     let password_bytes = read_password(false)?;
                     let mut input_file = File::open(input)?;
 
-                    let tmp_path = temp_path_for(output);
+                    let tmp_path = prepare_temp_output(output)?;
                     let mut output_file = File::create(&tmp_path)?;
 
                     let result = decrypt_container_v4(
@@ -1134,7 +1229,7 @@ fn cmd_dec(
                         let _ = std::fs::remove_file(&tmp_path);
                     }
                     result?;
-                    finalize_output(&tmp_path, output)?;
+                    finalize_output(&tmp_path, output, false)?;
                     Ok(())
                 }
                 AuthMode::PrivateKey(key_path) => {
@@ -1155,7 +1250,7 @@ fn cmd_dec(
                     let keyfile = read_private_keyfile(key_path)?;
                     let mut input_file = File::open(input)?;
 
-                    let tmp_path = temp_path_for(output);
+                    let tmp_path = prepare_temp_output(output)?;
                     let mut output_file = File::create(&tmp_path)?;
 
                     let result = decrypt_container_v4(
@@ -1168,7 +1263,7 @@ fn cmd_dec(
                         let _ = std::fs::remove_file(&tmp_path);
                     }
                     result?;
-                    finalize_output(&tmp_path, output)?;
+                    finalize_output(&tmp_path, output, false)?;
                     Ok(())
                 }
             }
@@ -1181,11 +1276,63 @@ fn temp_path_for(output: &Path) -> PathBuf {
     output.with_extension("tmp")
 }
 
-fn finalize_output(tmp_path: &Path, output: &Path) -> Result<(), std::io::Error> {
+fn ensure_output_path(output: &Path, allow_overwrite: bool) -> Result<(), CliError> {
     if output.exists() {
+        if output.is_dir() {
+            return Err(CliError::Cli(format!(
+                "output path is a directory: {}",
+                output.display()
+            )));
+        }
+        if !allow_overwrite {
+            return Err(CliError::Cli(format!(
+                "output path already exists: {}",
+                output.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_temp_output(output: &Path) -> Result<PathBuf, CliError> {
+    let tmp_path = temp_path_for(output);
+    if tmp_path.exists() {
+        if tmp_path.is_dir() {
+            return Err(CliError::Cli(format!(
+                "temporary output path is a directory: {}",
+                tmp_path.display()
+            )));
+        }
+        std::fs::remove_file(&tmp_path)?;
+    }
+    Ok(tmp_path)
+}
+
+fn finalize_output(tmp_path: &Path, output: &Path, allow_overwrite: bool) -> Result<(), CliError> {
+    if output.exists() {
+        if output.is_dir() {
+            let _ = std::fs::remove_file(tmp_path);
+            return Err(CliError::Cli(format!(
+                "output path is a directory: {}",
+                output.display()
+            )));
+        }
+        if !allow_overwrite {
+            let _ = std::fs::remove_file(tmp_path);
+            return Err(CliError::Cli(format!(
+                "output path already exists: {}",
+                output.display()
+            )));
+        }
         std::fs::remove_file(output)?;
     }
-    std::fs::rename(tmp_path, output)
+    match std::fs::rename(tmp_path, output) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = std::fs::remove_file(tmp_path);
+            Err(CliError::Io(err))
+        }
+    }
 }
 
 fn print_header(path: &Path, header: &aegis_format::FileHeader) {

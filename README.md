@@ -1,8 +1,20 @@
 # Aegis
 
-Aegis is a Rust workspace for building a secure, streaming container format and CLI tools.
-This repository focuses on correctness, hardening, and Windows-ready tooling with
-standard cryptography.
+Aegis is a Rust workspace for a deterministic, streaming container format (ACF v0-v4) and CLI
+tools that enforce explicit intent and fail-closed behavior.
+
+## What Aegis is
+
+- A streaming container format with strict parsing (ACF v0-v4).
+- A CLI that refuses ambiguous input and avoids partial outputs.
+- A toolkit for key files, password wrapping, and public-key recipients.
+
+## What Aegis is not
+
+- Not a key management system or password manager.
+- Not a network protocol, transport, or synchronization system.
+- Not a PKI or certificate authority.
+- Not a post-compromise secrecy system (no ratchet or prekeys).
 
 ## Workspace layout
 
@@ -14,13 +26,54 @@ standard cryptography.
 
 ## Security stance
 
-- Not production-ready and not audited.
-- No claims of being "unbreakable" or "military-grade".
-- The format uses standard, well-reviewed cryptography with key wrapping.
-- Public-key recipients use X25519 + HKDF-SHA256 for shared secret derivation.
-- Public-key recipients use per-container ephemeral keys, but there is no post-compromise secrecy.
-- Security-sensitive material is excluded from version control by default.
+- Uses standard, well-reviewed primitives (XChaCha20-Poly1305, Argon2id, X25519, HKDF-SHA256).
+- No external audit has been performed yet.
 - Password strength matters; weak passwords are vulnerable to offline guessing.
+- Public-key recipients use per-container ephemeral keys (no post-compromise secrecy).
+
+## Stability and compatibility contract
+
+### Version support
+
+- Inspectable: ACF v0-v4
+- Decryptable: ACF v1-v4 (per-recipient constraints apply)
+- Encryptable: ACF v0 (pack), ACF v3 (keyfile/password), ACF v4 (public-key recipients)
+- ACF v1/v2 containers are never emitted by the CLI
+- Unknown versions: hard error, no best-effort parsing (exit code 3)
+
+### Stability guarantees
+
+The following will not change silently:
+
+- File header and chunk table layout for supported versions
+- Magic values, IDs, and recipient type semantics
+- Cryptographic primitives and AAD domains
+- Exit code meanings and refusal rules
+
+Any of the following require a major version bump:
+
+- On-disk format changes (header, recipients, chunk layout)
+- Cryptographic primitive swaps or new algorithms
+- KDF parameter policy changes
+- Exit code or refusal behavior changes
+
+## Refusal and failure behavior
+
+- Output files are never overwritten unless `--force` is provided (`pack`, `unpack`, `enc`, `rotate`).
+- Decryption refuses to write if the output path already exists (no `--force` override).
+- Mixed recipient types require `--allow-mixed-recipients`.
+- Ambiguous or missing credential flags are rejected.
+- Failures emit a single-line error, use stable exit codes, and leave no partial outputs.
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0    | Success |
+| 2    | CLI misuse or unsupported flag combinations |
+| 3    | Format/validation error |
+| 4    | I/O error |
+| 5    | Cryptographic error or authentication failure |
 
 ## Building on Windows (cmd.exe)
 
@@ -33,14 +86,11 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-## Full system check (cmd.exe)
+## Release gate (cmd.exe)
 
-The integration script `scripts\check.bat` runs formatting, clippy, tests, fuzz
-smoke checks, and end-to-end CLI checks. It creates mock inputs and keys,
-exercises `pack`, `inspect`, `unpack`, `keygen`, `enc`, `dec`,
-`list-recipients`, and `rotate`, verifies roundtrips, and ensures wrong-key,
-wrong-password, corrupted ciphertext, public-key misuse, and rotation failures. For
-automation, it uses `AEGIS_PASSWORD` and `AEGIS_PASSWORD_CONFIRM`.
+`scripts\check.bat` is the authoritative release gate. A release is invalid unless it passes.
+The script runs formatting, clippy, tests, fuzz-lite, happy-path integration, refusal tests,
+tamper/corruption checks, stress cases, and cleanup verification using mock data only.
 
 ```
 scripts\check.bat
@@ -49,8 +99,7 @@ scripts\check.bat
 ## Fuzzing (fuzz-lite)
 
 `aegis-fuzzlite` runs a deterministic, dependency-free fuzz smoke test in
-CI and `scripts\check.bat`. It generates adversarial inputs and feeds them
-into the parser, decrypt, rotation, and public-key paths.
+CI and `scripts\check.bat`.
 
 ```
 cargo run -p aegis-fuzzlite -- --iters 1000 --max-len 4096
@@ -77,16 +126,16 @@ cargo run -p aegis-cli -- keygen C:\path\to\aegis.key
 :: Generate a public/private keypair (X25519)
 cargo run -p aegis-cli -- keygen --public C:\path\to\recipient.pub --private C:\path\to\recipient.priv
 
-:: Encrypt with multiple recipients (ACF v3)
-cargo run -p aegis-cli -- enc C:\path\to\input.bin C:\path\to\output.aegis --recipient-key C:\path\to\aegis.key --recipient-password
+:: Encrypt with multiple recipient types (explicitly allowed)
+cargo run -p aegis-cli -- enc C:\path\to\input.bin C:\path\to\output.aegis --recipient-key C:\path\to\aegis.key --recipient-password --allow-mixed-recipients
 
 :: Encrypt with a public-key recipient (ACF v4)
 cargo run -p aegis-cli -- enc C:\path\to\input.bin C:\path\to\output.aegis --recipient-pubkey C:\path\to\recipient.pub
 
-:: Decrypt with a key file (ACF v3)
+:: Decrypt with a key file (ACF v3/v4)
 cargo run -p aegis-cli -- dec C:\path\to\output.aegis C:\path\to\roundtrip.bin --recipient-key C:\path\to\aegis.key
 
-:: Decrypt with a password (ACF v3)
+:: Decrypt with a password (ACF v3/v4)
 cargo run -p aegis-cli -- dec C:\path\to\output.aegis C:\path\to\roundtrip.bin --recipient-password
 
 :: Decrypt with a private key (ACF v4)
@@ -97,23 +146,11 @@ cargo run -p aegis-cli -- list-recipients C:\path\to\output.aegis
 
 :: Rotate recipients (add/remove without re-encrypting the payload)
 cargo run -p aegis-cli -- rotate C:\path\to\output.aegis --output C:\path\to\rotated.aegis --auth-key C:\path\to\aegis.key --add-recipient-key C:\path\to\new.key --remove-recipient 1
-
-:: Build the CLI and use the .exe directly
-cargo build --release
-.\target\release\aegis-cli.exe inspect C:\path\to\container.aegis
 ```
 
-To enable logs:
+Logs are off by default. To enable logs:
 
 ```
 set RUST_LOG=info
 .\target\release\aegis-cli.exe inspect C:\path\to\container.aegis
 ```
-
-## Roadmap (high level)
-
-- Formalize the container format specification and versioning policy
-- Expand CLI with batch tooling, verification, and safe defaults
-- Add prekey/ratchet support for post-compromise secrecy (no PKI yet)
-- Harden envelope rotation UX and recipient discovery
-- Establish an external security review before production use

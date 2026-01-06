@@ -14,6 +14,23 @@ for multi-recipient envelopes. v4 extends recipients with public-key entries.
 - All offsets and lengths validated before use
 - Unknown versions MUST error
 
+## Compatibility contract
+
+### Version support
+
+- Inspectable: v0-v4
+- Decryptable: v1-v4
+- Encryptable: v0 (pack), v3 (keyfile/password), v4 (public-key recipients)
+- ACF v1/v2 containers are never emitted by the CLI
+- Unknown versions: hard error, no best-effort parsing
+
+### Stability guarantees
+
+- The on-disk layout for v0-v4 will not change silently.
+- Magic values, IDs, and recipient semantics are stable.
+- Cryptographic primitives and AAD domains are stable.
+- Any format change requires a major version bump.
+
 ## High-level layout
 
 ```
