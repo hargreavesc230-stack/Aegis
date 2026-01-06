@@ -518,17 +518,14 @@ fn make_chunks(payloads: Vec<(ChunkType, Vec<u8>)>) -> Vec<WriteChunkSource> {
 
 fn exercise_valid_seeds(seeds: &[SeedCase]) {
     for seed in seeds {
-        let _ = read_header(&mut Cursor::new(&seed.bytes));
+        let header = read_header(&mut Cursor::new(&seed.bytes)).ok();
         let _ = read_container(&mut Cursor::new(&seed.bytes));
         let _ = read_container_with_status(&mut Cursor::new(&seed.bytes));
         if let (Some(key), Some(wrap)) = (seed.key.as_ref(), seed.wrap) {
+            let version = header.as_ref().map(|header| header.0.version);
             let mut cursor = Cursor::new(&seed.bytes);
             let mut sink = io::sink();
-            let _ = decrypt_container_v2(&mut cursor, &mut sink, key.as_slice(), wrap);
-            let mut cursor = Cursor::new(&seed.bytes);
-            let _ = decrypt_container_v3(&mut cursor, &mut sink, key.as_slice(), wrap);
-            let mut cursor = Cursor::new(&seed.bytes);
-            let _ = decrypt_container_v4(&mut cursor, &mut sink, key.as_slice(), wrap);
+            let _ = decrypt_by_version(version, &mut cursor, &mut sink, key, wrap);
         }
     }
 }
@@ -630,7 +627,7 @@ fn run_case(stats: &mut FuzzStats, case: &mut FuzzCase) {
     if header_result.is_ok() {
         stats.header_ok += 1;
     }
-    if let Ok(header) = header_result {
+    if let Ok(ref header) = header_result {
         if header.version == ACF_VERSION_V0 {
             let _ = read_container_with_status(&mut Cursor::new(&case.bytes));
             let _ = extract_data_chunk(&mut Cursor::new(&case.bytes), &mut io::sink());
@@ -670,37 +667,40 @@ fn run_case(stats: &mut FuzzStats, case: &mut FuzzCase) {
         stats.container_ok += 1;
     }
     let _ = read_header(&mut Cursor::new(&case.bytes));
-    let mut decrypt_ok = decrypt_container_v2(
-        &mut Cursor::new(&case.bytes),
-        &mut io::sink(),
-        &case.key,
-        case.wrap,
-    )
-    .is_ok();
-
-    if !decrypt_ok {
-        decrypt_ok = decrypt_container_v3(
-            &mut Cursor::new(&case.bytes),
-            &mut io::sink(),
-            &case.key,
-            case.wrap,
-        )
-        .is_ok();
-    }
-
-    if !decrypt_ok {
-        decrypt_ok = decrypt_container_v4(
-            &mut Cursor::new(&case.bytes),
-            &mut io::sink(),
-            &case.key,
-            case.wrap,
-        )
-        .is_ok();
-    }
+    let version = header_result
+        .as_ref()
+        .ok()
+        .map(|header| header.version)
+        .or_else(|| read_version_field(&case.bytes));
+    let mut cursor = Cursor::new(&case.bytes);
+    let mut sink = io::sink();
+    let decrypt_ok = decrypt_by_version(version, &mut cursor, &mut sink, &case.key, case.wrap);
 
     if decrypt_ok {
         stats.decrypt_ok += 1;
     }
+}
+
+fn decrypt_by_version<R: io::Read, W: io::Write>(
+    version: Option<u16>,
+    cursor: &mut R,
+    sink: &mut W,
+    key: &[u8],
+    wrap: WrapType,
+) -> bool {
+    match version {
+        Some(ACF_VERSION_V2) => decrypt_container_v2(cursor, sink, key, wrap).is_ok(),
+        Some(ACF_VERSION_V3) => decrypt_container_v3(cursor, sink, key, wrap).is_ok(),
+        Some(ACF_VERSION_V4) => decrypt_container_v4(cursor, sink, key, wrap).is_ok(),
+        _ => false,
+    }
+}
+
+fn read_version_field(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 10 {
+        return None;
+    }
+    Some(u16::from_le_bytes([bytes[8], bytes[9]]))
 }
 
 fn mutate_bytes(rng: &mut XorShift64, bytes: &mut Vec<u8>, max_len: usize) {

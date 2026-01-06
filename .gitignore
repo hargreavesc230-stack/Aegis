@@ -77,3 +77,8 @@ coverage/
 # =========================
 *.aegis
 *.osf
+
+# =========================
+# Local scripts
+# =========================
+scripts/generate_examples.bat
