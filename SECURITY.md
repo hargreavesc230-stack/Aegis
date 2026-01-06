@@ -3,8 +3,9 @@
 ## Status
 
 Aegis is **not production-ready**. It is an evolving project with authenticated
-encryption, key files, and password-based recipients implemented, but it has
-not been externally audited. Do not use it to protect sensitive data.
+encryption, key files, password-based recipients, multi-recipient envelopes,
+and public-key recipients implemented, but it has not been externally audited.
+Do not use it to protect sensitive data.
 
 ## Reporting a vulnerability
 

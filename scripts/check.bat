@@ -48,10 +48,15 @@ set KEY_FILE=%TMP_DIR%\\test.key
 set KEY_FILE_2=%TMP_DIR%\\test2.key
 set KEY_FILE_3=%TMP_DIR%\\test3.key
 set KEY_FILE_WRONG=%TMP_DIR%\\wrong.key
+set PUB_KEY_FILE=%TMP_DIR%\\recipient.pub
+set PRIV_KEY_FILE=%TMP_DIR%\\recipient.priv
+set PUB_KEY_FILE_2=%TMP_DIR%\\recipient2.pub
+set PRIV_KEY_FILE_2=%TMP_DIR%\\recipient2.priv
 set ENC_FILE=%TMP_DIR%\\encrypted.aegis
 set DEC_FILE=%TMP_DIR%\\decrypted.bin
 set DEC_FILE_2=%TMP_DIR%\\decrypted2.bin
 set DEC_FILE_3=%TMP_DIR%\\decrypted3.bin
+set DEC_FILE_PUB=%TMP_DIR%\\decrypted_pub.bin
 set CORRUPT_FILE=%TMP_DIR%\\corrupt.aegis
 set WRONG_DEC_FILE=%TMP_DIR%\\wrong_dec.bin
 set WRONG_DEC_TMP=%TMP_DIR%\\wrong_dec.tmp
@@ -90,10 +95,17 @@ if errorlevel 1 goto fail
 cargo run -p aegis-cli -- keygen "%KEY_FILE_3%" --force
 if errorlevel 1 goto fail
 
+echo Generating public/private keypairs...
+cargo run -p aegis-cli -- keygen --public "%PUB_KEY_FILE%" --private "%PRIV_KEY_FILE%" --force
+if errorlevel 1 goto fail
+
+cargo run -p aegis-cli -- keygen --public "%PUB_KEY_FILE_2%" --private "%PRIV_KEY_FILE_2%" --force
+if errorlevel 1 goto fail
+
 echo Encrypting payload...
 set AEGIS_PASSWORD=mock-pass-123
 set AEGIS_PASSWORD_CONFIRM=mock-pass-123
-cargo run -p aegis-cli -- enc "%INPUT_FILE%" "%ENC_FILE%" --recipient-key "%KEY_FILE%" --recipient-key "%KEY_FILE_2%" --recipient-password
+cargo run -p aegis-cli -- enc "%INPUT_FILE%" "%ENC_FILE%" --recipient-key "%KEY_FILE%" --recipient-key "%KEY_FILE_2%" --recipient-password --recipient-pubkey "%PUB_KEY_FILE%"
 if errorlevel 1 goto fail
 
 echo Decrypting payload (recipient 1)...
@@ -117,12 +129,19 @@ if errorlevel 1 goto fail
 fc /b "%INPUT_FILE%" "%DEC_FILE_3%" >nul
 if errorlevel 1 goto fail
 
+echo Decrypting payload (public key recipient)...
+cargo run -p aegis-cli -- dec "%ENC_FILE%" "%DEC_FILE_PUB%" --private-key "%PRIV_KEY_FILE%"
+if errorlevel 1 goto fail
+
+fc /b "%INPUT_FILE%" "%DEC_FILE_PUB%" >nul
+if errorlevel 1 goto fail
+
 echo Listing recipients...
 cargo run -p aegis-cli -- list-recipients "%ENC_FILE%"
 if errorlevel 1 goto fail
 
 echo Rotating recipients...
-cargo run -p aegis-cli -- rotate "%ENC_FILE%" --output "%ROTATED_FILE%" --auth-key "%KEY_FILE_2%" --add-recipient-key "%KEY_FILE_3%" --remove-recipient 1
+cargo run -p aegis-cli -- rotate "%ENC_FILE%" --output "%ROTATED_FILE%" --auth-key "%KEY_FILE_2%" --add-recipient-key "%KEY_FILE_3%" --add-recipient-pubkey "%PUB_KEY_FILE_2%" --remove-recipient 1
 if errorlevel 1 goto fail
 
 echo Verifying removed recipient fails...
@@ -136,6 +155,12 @@ echo Verifying new recipient works...
 cargo run -p aegis-cli -- dec "%ROTATED_FILE%" "%DEC_FILE%" --recipient-key "%KEY_FILE_3%"
 if errorlevel 1 goto fail
 fc /b "%INPUT_FILE%" "%DEC_FILE%" >nul
+if errorlevel 1 goto fail
+
+echo Verifying rotated public key recipient works...
+cargo run -p aegis-cli -- dec "%ROTATED_FILE%" "%DEC_FILE_PUB%" --private-key "%PRIV_KEY_FILE_2%"
+if errorlevel 1 goto fail
+fc /b "%INPUT_FILE%" "%DEC_FILE_PUB%" >nul
 if errorlevel 1 goto fail
 
 echo Verifying existing recipient works...
@@ -157,6 +182,13 @@ cargo run -p aegis-cli -- keygen "%KEY_FILE_WRONG%" --force
 if errorlevel 1 goto fail
 
 cargo run -p aegis-cli -- dec "%ENC_FILE%" "%WRONG_DEC_FILE%" --recipient-key "%KEY_FILE_WRONG%"
+set CODE=%ERRORLEVEL%
+if not "%CODE%"=="5" goto fail
+if exist "%WRONG_DEC_FILE%" del /q "%WRONG_DEC_FILE%"
+if exist "%WRONG_DEC_TMP%" del /q "%WRONG_DEC_TMP%"
+
+echo Verifying wrong private key rejection...
+cargo run -p aegis-cli -- dec "%ENC_FILE%" "%WRONG_DEC_FILE%" --private-key "%PRIV_KEY_FILE_2%"
 set CODE=%ERRORLEVEL%
 if not "%CODE%"=="5" goto fail
 if exist "%WRONG_DEC_FILE%" del /q "%WRONG_DEC_FILE%"

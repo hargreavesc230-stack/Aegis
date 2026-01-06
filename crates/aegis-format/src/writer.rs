@@ -7,13 +7,15 @@ use aegis_core::crypto::kdf::{
     DEFAULT_SALT_LEN,
 };
 use aegis_core::crypto::keyfile::generate_key;
+use aegis_core::crypto::public_key::{derive_wrapping_key, generate_keypair};
 use aegis_core::crypto::wrap::{wrap_key, wrap_key_with_aad};
 use aegis_core::Crc32;
 
 use crate::acf::{
     encode_chunk_entry, encode_footer_v0, encode_footer_v1, encode_header, recipient_aad,
-    ChunkEntry, ChunkType, FileHeader, FooterV0, FooterV1, FormatError, RecipientEntry,
-    V3HeaderParams, WrapAlg, WrapType, CHUNK_LEN, HEADER_BASE_LEN, MAX_CHUNK_COUNT,
+    recipient_aad_v4, ChunkEntry, ChunkType, FileHeader, FooterV0, FooterV1, FormatError,
+    RecipientEntry, V3HeaderParams, V4HeaderParams, WrapAlg, WrapType, CHUNK_LEN, HEADER_BASE_LEN,
+    MAX_CHUNK_COUNT,
 };
 use crate::validate::{validate_chunks, validate_header};
 
@@ -28,7 +30,8 @@ pub struct WriteChunkSource {
 pub struct RecipientSpec<'a> {
     pub recipient_id: u32,
     pub recipient_type: WrapType,
-    pub key_material: &'a [u8],
+    pub key_material: Option<&'a [u8]>,
+    pub public_key: Option<[u8; crate::acf::RECIPIENT_PUBLIC_KEY_LEN]>,
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +267,9 @@ pub fn write_encrypted_container_v3<W: Write>(
     let mut ids = HashSet::with_capacity(recipients.len());
     let mut requires_password_params = false;
     for recipient in recipients {
+        if recipient.recipient_type == WrapType::PublicKey || recipient.public_key.is_some() {
+            return Err(FormatError::UnsupportedWrapType(WrapType::PublicKey as u16));
+        }
         if !ids.insert(recipient.recipient_id) {
             return Err(FormatError::DuplicateRecipientId(recipient.recipient_id));
         }
@@ -285,7 +291,10 @@ pub fn write_encrypted_container_v3<W: Write>(
 
     let mut recipient_entries = Vec::with_capacity(recipients.len());
     for recipient in recipients {
-        let derived = derive_key(recipient.key_material, &salt, kdf_params)?;
+        let key_material = recipient
+            .key_material
+            .ok_or(FormatError::MissingRecipientKeyMaterial)?;
+        let derived = derive_key(key_material, &salt, kdf_params)?;
         let wrap_alg = WrapAlg::XChaCha20Poly1305;
         let aad = recipient_aad(recipient.recipient_id, recipient.recipient_type, wrap_alg);
         let wrapped_key = wrap_key_with_aad(derived.as_slice(), data_key.as_slice(), &aad)?;
@@ -294,6 +303,8 @@ pub fn write_encrypted_container_v3<W: Write>(
             recipient_type: recipient.recipient_type,
             wrap_alg,
             wrapped_key,
+            recipient_pubkey: None,
+            ephemeral_pubkey: None,
         });
     }
 
@@ -334,6 +345,186 @@ pub fn write_encrypted_container_v3<W: Write>(
         chunk_count,
         footer_offset,
         V3HeaderParams {
+            cipher_id: CipherId::XChaCha20Poly1305,
+            kdf_id: KdfId::Argon2id,
+            kdf_params: crate::acf::KdfParamsHeader {
+                memory_kib: kdf_params.memory_kib,
+                iterations: kdf_params.iterations,
+                parallelism: kdf_params.parallelism,
+            },
+            salt: salt.to_vec(),
+            nonce: nonce.to_vec(),
+            recipients: recipient_entries,
+        },
+    )?;
+
+    validate_header(&header)?;
+    validate_chunks(&header, &entries)?;
+
+    let header_bytes = encode_header(&header)?;
+    writer.write_all(&header_bytes).map_err(map_io)?;
+
+    let mut table_bytes = Vec::with_capacity(entries.len() * CHUNK_LEN);
+    for entry in &entries {
+        table_bytes.extend_from_slice(&encode_chunk_entry(entry));
+    }
+
+    let footer_bytes = encode_footer_v1(&footer);
+
+    let mut payload = PayloadReader::new(&table_bytes, chunks, &footer_bytes);
+    encrypt_stream(
+        &mut payload,
+        writer,
+        data_key.as_slice(),
+        &nonce,
+        &header_bytes,
+    )?;
+
+    Ok(WrittenEncryptedContainer {
+        header,
+        chunks: entries,
+        footer,
+    })
+}
+
+pub fn write_encrypted_container_v4<W: Write>(
+    writer: &mut W,
+    chunks: &mut [WriteChunkSource],
+    recipients: &[RecipientSpec<'_>],
+) -> Result<WrittenEncryptedContainer, FormatError> {
+    use std::collections::HashSet;
+
+    if chunks.len() > MAX_CHUNK_COUNT as usize {
+        return Err(FormatError::ChunkCountTooLarge);
+    }
+    if recipients.is_empty() {
+        return Err(FormatError::MissingRecipients);
+    }
+
+    let mut ids = HashSet::with_capacity(recipients.len());
+    let mut requires_password_params = false;
+    let mut has_public = false;
+    for recipient in recipients {
+        if !ids.insert(recipient.recipient_id) {
+            return Err(FormatError::DuplicateRecipientId(recipient.recipient_id));
+        }
+        match recipient.recipient_type {
+            WrapType::Password => requires_password_params = true,
+            WrapType::PublicKey => has_public = true,
+            WrapType::Keyfile => {}
+        }
+    }
+
+    let kdf_params = if requires_password_params {
+        DEFAULT_PASSWORD_PARAMS
+    } else {
+        DEFAULT_KEYFILE_PARAMS
+    };
+
+    let chunk_count = chunks.len() as u32;
+    let salt = generate_salt(DEFAULT_SALT_LEN)?;
+    let nonce = generate_nonce()?;
+    // Keep the data key in a zeroizing buffer to reduce key lifetime in memory.
+    let data_key = generate_key(AEAD_KEY_LEN)?;
+
+    let mut ephemeral_private = None;
+    let mut ephemeral_public = None;
+    if has_public {
+        let (private, public) = generate_keypair()?;
+        // The ephemeral private key is zeroized when it goes out of scope.
+        ephemeral_private = Some(private);
+        ephemeral_public = Some(public);
+    }
+
+    let mut recipient_entries = Vec::with_capacity(recipients.len());
+    for recipient in recipients {
+        let wrap_alg = WrapAlg::XChaCha20Poly1305;
+        let (wrapped_key, recipient_pubkey, ephemeral_pubkey) = match recipient.recipient_type {
+            WrapType::Keyfile | WrapType::Password => {
+                let key_material = recipient
+                    .key_material
+                    .ok_or(FormatError::MissingRecipientKeyMaterial)?;
+                let derived = derive_key(key_material, &salt, kdf_params)?;
+                let aad = recipient_aad_v4(
+                    recipient.recipient_id,
+                    recipient.recipient_type,
+                    wrap_alg,
+                    None,
+                    None,
+                );
+                let wrapped = wrap_key_with_aad(derived.as_slice(), data_key.as_slice(), &aad)?;
+                (wrapped, None, None)
+            }
+            WrapType::PublicKey => {
+                let public_key = recipient
+                    .public_key
+                    .ok_or(FormatError::MissingRecipientPublicKey)?;
+                let private_key = ephemeral_private
+                    .as_ref()
+                    .ok_or(FormatError::MissingRecipientEphemeralKey)?;
+                let ephemeral_pub = *ephemeral_public
+                    .as_ref()
+                    .ok_or(FormatError::MissingRecipientEphemeralKey)?;
+                let derived = derive_wrapping_key(private_key, &public_key)?;
+                let aad = recipient_aad_v4(
+                    recipient.recipient_id,
+                    recipient.recipient_type,
+                    wrap_alg,
+                    Some(&public_key),
+                    Some(&ephemeral_pub),
+                );
+                let wrapped = wrap_key_with_aad(derived.as_slice(), data_key.as_slice(), &aad)?;
+                (wrapped, Some(public_key), Some(ephemeral_pub))
+            }
+        };
+
+        recipient_entries.push(RecipientEntry {
+            recipient_id: recipient.recipient_id,
+            recipient_type: recipient.recipient_type,
+            wrap_alg,
+            wrapped_key,
+            recipient_pubkey,
+            ephemeral_pubkey,
+        });
+    }
+
+    let header_len = crate::acf::header_len_v4(&salt, &nonce, &recipient_entries)? as u64;
+    let table_len = (chunk_count as u64)
+        .checked_mul(CHUNK_LEN as u64)
+        .ok_or(FormatError::ChunkCountTooLarge)?;
+    let data_start = header_len
+        .checked_add(table_len)
+        .ok_or(FormatError::ChunkCountTooLarge)?;
+
+    let mut entries = Vec::with_capacity(chunks.len());
+    let mut offset = data_start;
+
+    for (index, chunk) in chunks.iter().enumerate() {
+        let next_offset =
+            offset
+                .checked_add(chunk.length)
+                .ok_or(FormatError::ChunkLengthOverflow {
+                    index: index as u32,
+                })?;
+
+        entries.push(ChunkEntry {
+            chunk_id: chunk.chunk_id,
+            chunk_type: chunk.chunk_type,
+            flags: chunk.flags,
+            offset,
+            length: chunk.length,
+        });
+
+        offset = next_offset;
+    }
+
+    let footer = FooterV1::new();
+    let footer_offset = offset;
+
+    let header = FileHeader::new_v4(
+        chunk_count,
+        footer_offset,
+        V4HeaderParams {
             cipher_id: CipherId::XChaCha20Poly1305,
             kdf_id: KdfId::Argon2id,
             kdf_params: crate::acf::KdfParamsHeader {

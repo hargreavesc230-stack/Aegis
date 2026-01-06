@@ -9,6 +9,7 @@ use crate::crypto::CryptoError;
 pub const WRAP_NONCE_LEN: usize = 24;
 pub const WRAP_AAD_V2: &[u8] = b"AEGIS-KW-V2";
 pub const WRAP_AAD_V3_PREFIX: &[u8] = b"AEGIS-KW-V3";
+pub const WRAP_AAD_V4_PREFIX: &[u8] = b"AEGIS-KW-V4";
 
 pub fn wrap_key(wrapping_key: &[u8], data_key: &[u8]) -> Result<Vec<u8>, CryptoError> {
     wrap_key_with_aad(wrapping_key, data_key, WRAP_AAD_V2)

@@ -14,6 +14,8 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 scripts\check.bat
 ```
+`scripts\check.bat` includes fuzz-lite and end-to-end CLI validation. If you
+touch container parsing or cryptography, run it before submitting.
 
 ## Guidelines
 

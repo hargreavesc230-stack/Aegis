@@ -9,9 +9,10 @@ use std::collections::HashSet;
 use aegis_core::crypto::wrap::WRAP_NONCE_LEN;
 
 use crate::acf::{
-    header_len_v1, header_len_v2, header_len_v3, ChunkEntry, CryptoHeader, FileHeader, FormatError,
-    WrapType, ACF_VERSION_V0, ACF_VERSION_V1, ACF_VERSION_V2, ACF_VERSION_V3, CHUNK_LEN,
-    HEADER_BASE_LEN_U16, MAX_CHUNK_COUNT, MAX_WRAPPED_KEY_LEN,
+    header_len_v1, header_len_v2, header_len_v3, header_len_v4, ChunkEntry, CryptoHeader,
+    FileHeader, FormatError, WrapType, ACF_VERSION_V0, ACF_VERSION_V1, ACF_VERSION_V2,
+    ACF_VERSION_V3, ACF_VERSION_V4, CHUNK_LEN, HEADER_BASE_LEN_U16, MAX_CHUNK_COUNT,
+    MAX_WRAPPED_KEY_LEN,
 };
 
 pub fn validate_header(header: &FileHeader) -> Result<(), FormatError> {
@@ -105,6 +106,9 @@ pub fn validate_header(header: &FileHeader) -> Result<(), FormatError> {
             match wrap_type {
                 WrapType::Keyfile => enforce_kdf_minimums(kdf_params, DEFAULT_KEYFILE_PARAMS)?,
                 WrapType::Password => enforce_kdf_minimums(kdf_params, DEFAULT_PASSWORD_PARAMS)?,
+                WrapType::PublicKey => {
+                    return Err(FormatError::UnsupportedWrapType(WrapType::PublicKey as u16))
+                }
             }
         }
         ACF_VERSION_V3 => {
@@ -147,6 +151,12 @@ pub fn validate_header(header: &FileHeader) -> Result<(), FormatError> {
                 if !ids.insert(recipient.recipient_id) {
                     return Err(FormatError::DuplicateRecipientId(recipient.recipient_id));
                 }
+                if recipient.recipient_type == WrapType::PublicKey
+                    || recipient.recipient_pubkey.is_some()
+                    || recipient.ephemeral_pubkey.is_some()
+                {
+                    return Err(FormatError::UnsupportedWrapType(WrapType::PublicKey as u16));
+                }
                 if recipient.wrapped_key.is_empty()
                     || recipient.wrapped_key.len() > MAX_WRAPPED_KEY_LEN
                 {
@@ -169,6 +179,88 @@ pub fn validate_header(header: &FileHeader) -> Result<(), FormatError> {
             if requires_password_params {
                 enforce_kdf_minimums(kdf_params, DEFAULT_PASSWORD_PARAMS)?;
             } else {
+                enforce_kdf_minimums(kdf_params, DEFAULT_KEYFILE_PARAMS)?;
+            }
+        }
+        ACF_VERSION_V4 => {
+            let crypto = header
+                .crypto
+                .as_ref()
+                .ok_or(FormatError::MissingCryptoHeader)?;
+            let (kdf_params, salt, nonce, recipients) = match crypto {
+                CryptoHeader::V4 {
+                    kdf_params,
+                    salt,
+                    nonce,
+                    recipients,
+                    ..
+                } => (kdf_params, salt, nonce, recipients),
+                _ => return Err(FormatError::MissingCryptoHeader),
+            };
+            let expected_len = header_len_v4(salt, nonce, recipients)?;
+            if header.header_len != expected_len {
+                return Err(FormatError::InvalidHeaderLength {
+                    found: header.header_len,
+                    expected: expected_len,
+                });
+            }
+            if salt.len() != DEFAULT_SALT_LEN {
+                return Err(FormatError::InvalidSaltLength(salt.len() as u16));
+            }
+            if nonce.len() != AEAD_NONCE_LEN {
+                return Err(FormatError::InvalidNonceLength(nonce.len() as u16));
+            }
+            if recipients.is_empty() {
+                return Err(FormatError::MissingRecipients);
+            }
+
+            let min_wrapped = 2 + WRAP_NONCE_LEN + AEAD_TAG_LEN;
+            let mut ids = HashSet::with_capacity(recipients.len());
+            let mut requires_password_params = false;
+            let mut has_keyfile = false;
+
+            for recipient in recipients {
+                if !ids.insert(recipient.recipient_id) {
+                    return Err(FormatError::DuplicateRecipientId(recipient.recipient_id));
+                }
+                if recipient.wrapped_key.is_empty()
+                    || recipient.wrapped_key.len() > MAX_WRAPPED_KEY_LEN
+                {
+                    return Err(FormatError::InvalidRecipientWrappedKeyLength(
+                        recipient.wrapped_key.len() as u32,
+                    ));
+                }
+                if recipient.wrapped_key.len() < min_wrapped {
+                    return Err(FormatError::InvalidRecipientWrappedKeyLength(
+                        recipient.wrapped_key.len() as u32,
+                    ));
+                }
+
+                match recipient.recipient_type {
+                    WrapType::Password => requires_password_params = true,
+                    WrapType::Keyfile => has_keyfile = true,
+                    WrapType::PublicKey => {
+                        if recipient.recipient_pubkey.is_none() {
+                            return Err(FormatError::MissingRecipientPublicKey);
+                        }
+                        if recipient.ephemeral_pubkey.is_none() {
+                            return Err(FormatError::MissingRecipientEphemeralKey);
+                        }
+                    }
+                }
+
+                if recipient.recipient_type != WrapType::PublicKey
+                    && (recipient.recipient_pubkey.is_some()
+                        || recipient.ephemeral_pubkey.is_some())
+                {
+                    return Err(FormatError::UnsupportedWrapType(WrapType::PublicKey as u16));
+                }
+            }
+
+            validate_kdf_params(kdf_params)?;
+            if requires_password_params {
+                enforce_kdf_minimums(kdf_params, DEFAULT_PASSWORD_PARAMS)?;
+            } else if has_keyfile {
                 enforce_kdf_minimums(kdf_params, DEFAULT_KEYFILE_PARAMS)?;
             }
         }

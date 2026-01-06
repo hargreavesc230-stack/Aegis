@@ -1,10 +1,10 @@
-# Format Overview (ACF v0-v3)
+# Format Overview (ACF v0-v4)
 
 Aegis Container Format (ACF) is a deterministic, streaming-first binary layout
 with strict parsing rules. v0 is unencrypted; v1 adds authenticated encryption
 (XChaCha20-Poly1305) while keeping the header in plaintext. v2 adds key wrapping
 so passwords never directly encrypt payloads. v3 introduces a recipients table
-for multi-recipient envelopes.
+for multi-recipient envelopes. v4 extends recipients with public-key entries.
 
 ## Global rules
 
@@ -23,7 +23,7 @@ for multi-recipient envelopes.
 [ Footer ]
 ```
 
-For v1-v3, the `ChunkTable`, `ChunkData`, and `Footer` are encrypted as a single
+For v1-v4, the `ChunkTable`, `ChunkData`, and `Footer` are encrypted as a single
 payload. Only the header is plaintext and authenticated as AAD. Offsets and
 lengths in the header and chunk table refer to the plaintext layout, not the
 ciphertext layout.
@@ -35,7 +35,7 @@ Length: 36 bytes
 | Offset | Size | Field              | Description                             |
 |--------|------|--------------------|-----------------------------------------|
 | 0      | 8    | magic              | ASCII `AEGIS\0\0\0`                   |
-| 8      | 2    | version            | v0 = 0, v1 = 1, v2 = 2, v3 = 3          |
+| 8      | 2    | version            | v0 = 0, v1 = 1, v2 = 2, v3 = 3, v4 = 4 |
 | 10     | 2    | header_len         | Total header length in bytes            |
 | 12     | 4    | flags              | Reserved, must be 0                     |
 | 16     | 4    | chunk_count        | Number of chunk table entries           |
@@ -132,6 +132,26 @@ Rules:
 - Unknown recipient types or wrap algorithms MUST error
 - wrapped_key_len MUST be bounded and validated before use
 
+## Header extensions (v4)
+
+v4 keeps the v3 header layout but extends recipients for public-key entries.
+
+Recipient entries (v4):
+
+| Field              | Size | Description                         |
+|--------------------|------|-------------------------------------|
+| recipient_id       | 4    | Unique ID per recipient             |
+| recipient_type     | 2    | 0x0001 = Keyfile, 0x0002 = Password, 0x0003 = PublicKey |
+| wrap_alg           | 2    | 0x0001 = XChaCha20-Poly1305         |
+| recipient_pubkey   | 32   | X25519 public key (public-key only) |
+| ephemeral_pubkey   | 32   | Sender ephemeral pubkey (public-key only) |
+| wrapped_key_len    | 4    | Length of wrapped key bytes         |
+| wrapped_key        | N    | Wrapped data key bytes              |
+
+For keyfile/password recipients, the public-key fields are omitted.
+Public-key entries include both keys and are authenticated as AAD; the
+ephemeral key must be freshly generated per container.
+
 ## ChunkTable
 
 Each entry is 24 bytes. Entries MUST be sorted and contiguous by offset.
@@ -166,4 +186,4 @@ and should not be fully loaded into memory by default.
 
 - v0: checksum footer (CRC32) for tamper detection only
 - v1: fixed-length footer (no checksum) inside encrypted payload
-- v2/v3: same as v1 (inside encrypted payload)
+- v2-v4: same as v1 (inside encrypted payload)

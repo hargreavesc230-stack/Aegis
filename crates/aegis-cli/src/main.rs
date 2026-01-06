@@ -5,12 +5,17 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use aegis_core::crypto::keyfile::{generate_key, read_keyfile, write_keyfile};
+use aegis_core::crypto::public_key::{
+    generate_keypair, read_private_keyfile, read_public_keyfile, write_private_keyfile,
+    write_public_keyfile,
+};
 use aegis_core::crypto::CryptoError;
 use aegis_format::{
-    decrypt_container, decrypt_container_v2, decrypt_container_v3, extract_data_chunk,
-    read_container_with_status, read_header, rotate_container_v3, write_container,
-    write_encrypted_container_v3, ChunkType, CryptoHeader, FormatError, ParsedContainer,
-    RecipientSpec, WrapType, ACF_VERSION_V2, ACF_VERSION_V3,
+    decrypt_container, decrypt_container_v2, decrypt_container_v3, decrypt_container_v4,
+    extract_data_chunk, read_container_with_status, read_header, rotate_container_v3,
+    rotate_container_v4, write_container, write_encrypted_container_v3,
+    write_encrypted_container_v4, ChunkType, CryptoHeader, FormatError, ParsedContainer,
+    RecipientSpec, WrapType, ACF_VERSION_V2, ACF_VERSION_V3, ACF_VERSION_V4,
 };
 use clap::{Parser, Subcommand};
 use rpassword::prompt_password;
@@ -48,9 +53,14 @@ enum Commands {
     Unpack { input: PathBuf, output: PathBuf },
     /// Generate a new key file
     Keygen {
-        output: PathBuf,
+        #[arg(value_name = "PATH")]
+        output: Option<PathBuf>,
         #[arg(long)]
         force: bool,
+        #[arg(long = "public", value_name = "PATH")]
+        public: Option<PathBuf>,
+        #[arg(long = "private", value_name = "PATH")]
+        private: Option<PathBuf>,
     },
     /// Encrypt a payload into a new container
     Enc {
@@ -58,6 +68,8 @@ enum Commands {
         output: PathBuf,
         #[arg(long = "recipient-key", alias = "key", value_name = "PATH")]
         recipient_keys: Vec<PathBuf>,
+        #[arg(long = "recipient-pubkey", value_name = "PATH")]
+        recipient_pubkeys: Vec<PathBuf>,
         #[arg(long = "recipient-password", alias = "password")]
         recipient_password: bool,
     },
@@ -67,6 +79,8 @@ enum Commands {
         output: PathBuf,
         #[arg(long = "recipient-key", alias = "key", value_name = "PATH")]
         recipient_key: Option<PathBuf>,
+        #[arg(long = "private-key", value_name = "PATH")]
+        private_key: Option<PathBuf>,
         #[arg(long = "recipient-password", alias = "password")]
         recipient_password: bool,
     },
@@ -79,10 +93,14 @@ enum Commands {
         output: PathBuf,
         #[arg(long = "auth-key", value_name = "PATH")]
         auth_key: Option<PathBuf>,
+        #[arg(long = "auth-private-key", value_name = "PATH")]
+        auth_private_key: Option<PathBuf>,
         #[arg(long = "auth-password")]
         auth_password: bool,
         #[arg(long = "add-recipient-key", value_name = "PATH")]
         add_recipient_keys: Vec<PathBuf>,
+        #[arg(long = "add-recipient-pubkey", value_name = "PATH")]
+        add_recipient_pubkeys: Vec<PathBuf>,
         #[arg(long = "add-recipient-password")]
         add_recipient_password: bool,
         #[arg(long = "remove-recipient", value_name = "ID")]
@@ -126,22 +144,41 @@ fn run() -> i32 {
             metadata,
         } => cmd_pack(&input, &output, metadata.as_deref()),
         Commands::Unpack { input, output } => cmd_unpack(&input, &output),
-        Commands::Keygen { output, force } => cmd_keygen(&output, force),
+        Commands::Keygen {
+            output,
+            force,
+            public,
+            private,
+        } => cmd_keygen(
+            output.as_deref(),
+            public.as_deref(),
+            private.as_deref(),
+            force,
+        ),
         Commands::Enc {
             input,
             output,
             recipient_keys,
+            recipient_pubkeys,
             recipient_password,
-        } => cmd_enc(&input, &output, &recipient_keys, recipient_password),
+        } => cmd_enc(
+            &input,
+            &output,
+            &recipient_keys,
+            &recipient_pubkeys,
+            recipient_password,
+        ),
         Commands::Dec {
             input,
             output,
             recipient_key,
+            private_key,
             recipient_password,
         } => cmd_dec(
             &input,
             &output,
             recipient_key.as_deref(),
+            private_key.as_deref(),
             recipient_password,
         ),
         Commands::ListRecipients { input } => cmd_list_recipients(&input),
@@ -149,19 +186,23 @@ fn run() -> i32 {
             input,
             output,
             auth_key,
+            auth_private_key,
             auth_password,
             add_recipient_keys,
+            add_recipient_pubkeys,
             add_recipient_password,
             remove_recipient_ids,
-        } => cmd_rotate(
-            &input,
-            &output,
-            auth_key.as_deref(),
+        } => cmd_rotate(RotateArgs {
+            input: &input,
+            output: &output,
+            auth_key: auth_key.as_deref(),
+            auth_private_key: auth_private_key.as_deref(),
             auth_password,
-            &add_recipient_keys,
+            add_recipient_keys: &add_recipient_keys,
+            add_recipient_pubkeys: &add_recipient_pubkeys,
             add_recipient_password,
-            &remove_recipient_ids,
-        ),
+            remove_recipient_ids: &remove_recipient_ids,
+        }),
     };
 
     match result {
@@ -216,6 +257,8 @@ fn cmd_inspect(path: &Path) -> Result<(), CliError> {
         print_v2_details(&header);
     } else if header.version == ACF_VERSION_V3 {
         print_v3_details(&header);
+    } else if header.version == ACF_VERSION_V4 {
+        print_v4_details(&header);
     }
 
     Ok(())
@@ -273,45 +316,81 @@ fn cmd_unpack(input: &Path, output: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-fn cmd_keygen(output: &Path, force: bool) -> Result<(), CliError> {
-    info!(output = %output.display(), "generating key file");
-
-    let key = generate_key(KEY_LEN)?;
-    write_keyfile(output, key.as_slice(), force)?;
-
-    Ok(())
+fn cmd_keygen(
+    output: Option<&Path>,
+    public: Option<&Path>,
+    private: Option<&Path>,
+    force: bool,
+) -> Result<(), CliError> {
+    match (output, public, private) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(CliError::Cli(
+            "use either key file output or --public/--private, not both".to_string(),
+        )),
+        (_, Some(pub_path), Some(priv_path)) => {
+            info!(
+                public = %pub_path.display(),
+                private = %priv_path.display(),
+                "generating public/private keypair"
+            );
+            let (private_key, public_key) = generate_keypair()?;
+            write_public_keyfile(pub_path, &public_key, force)?;
+            write_private_keyfile(priv_path, &private_key, force)?;
+            Ok(())
+        }
+        (_, None, Some(_)) | (_, Some(_), None) => Err(CliError::Cli(
+            "both --public and --private are required for keypair generation".to_string(),
+        )),
+        (Some(out_path), None, None) => {
+            info!(output = %out_path.display(), "generating key file");
+            let key = generate_key(KEY_LEN)?;
+            write_keyfile(out_path, key.as_slice(), force)?;
+            Ok(())
+        }
+        (None, None, None) => Err(CliError::Cli(
+            "missing output path for key generation".to_string(),
+        )),
+    }
 }
 
 enum AuthMode<'a> {
     Keyfile(&'a Path),
     Password,
+    PrivateKey(&'a Path),
 }
 
-fn resolve_mode<'a>(key_path: Option<&'a Path>, password: bool) -> Result<AuthMode<'a>, CliError> {
-    match (key_path, password) {
-        (Some(path), false) => Ok(AuthMode::Keyfile(path)),
-        (None, true) => Ok(AuthMode::Password),
-        (Some(_), true) => Err(CliError::Cli(
-            "choose either --recipient-key or --recipient-password, not both".to_string(),
+fn resolve_mode<'a>(
+    key_path: Option<&'a Path>,
+    private_key: Option<&'a Path>,
+    password: bool,
+) -> Result<AuthMode<'a>, CliError> {
+    match (key_path, private_key, password) {
+        (Some(path), None, false) => Ok(AuthMode::Keyfile(path)),
+        (None, Some(path), false) => Ok(AuthMode::PrivateKey(path)),
+        (None, None, true) => Ok(AuthMode::Password),
+        (Some(_), _, true) | (_, Some(_), true) | (Some(_), Some(_), false) => Err(CliError::Cli(
+            "choose only one of --recipient-key, --private-key, or --recipient-password"
+                .to_string(),
         )),
-        (None, false) => Err(CliError::Cli(
-            "missing --recipient-key or --recipient-password".to_string(),
+        (None, None, false) => Err(CliError::Cli(
+            "missing --recipient-key, --private-key, or --recipient-password".to_string(),
         )),
     }
 }
 
 fn resolve_auth_mode<'a>(
     key_path: Option<&'a Path>,
+    private_key: Option<&'a Path>,
     password: bool,
 ) -> Result<AuthMode<'a>, CliError> {
-    match (key_path, password) {
-        (Some(path), false) => Ok(AuthMode::Keyfile(path)),
-        (None, true) => Ok(AuthMode::Password),
-        (Some(_), true) => Err(CliError::Cli(
-            "choose either --auth-key or --auth-password, not both".to_string(),
+    match (key_path, private_key, password) {
+        (Some(path), None, false) => Ok(AuthMode::Keyfile(path)),
+        (None, Some(path), false) => Ok(AuthMode::PrivateKey(path)),
+        (None, None, true) => Ok(AuthMode::Password),
+        (Some(_), _, true) | (_, Some(_), true) | (Some(_), Some(_), false) => Err(CliError::Cli(
+            "choose only one of --auth-key, --auth-private-key, or --auth-password".to_string(),
         )),
-        (None, false) => Err(CliError::Cli(
-            "missing --auth-key or --auth-password".to_string(),
+        (None, None, false) => Err(CliError::Cli(
+            "missing --auth-key, --auth-private-key, or --auth-password".to_string(),
         )),
     }
 }
@@ -343,11 +422,12 @@ fn cmd_enc(
     input: &Path,
     output: &Path,
     recipient_keys: &[PathBuf],
+    recipient_pubkeys: &[PathBuf],
     recipient_password: bool,
 ) -> Result<(), CliError> {
-    if recipient_keys.is_empty() && !recipient_password {
+    if recipient_keys.is_empty() && recipient_pubkeys.is_empty() && !recipient_password {
         return Err(CliError::Cli(
-            "missing --recipient-key or --recipient-password".to_string(),
+            "missing --recipient-key, --recipient-pubkey, or --recipient-password".to_string(),
         ));
     }
 
@@ -368,13 +448,21 @@ fn cmd_enc(
         reader: Box::new(input_file),
     }];
 
-    let total_recipients = recipient_keys.len() + if recipient_password { 1 } else { 0 };
+    let total_recipients =
+        recipient_keys.len() + recipient_pubkeys.len() + if recipient_password { 1 } else { 0 };
     let mut materials: Vec<(WrapType, Zeroizing<Vec<u8>>)> = Vec::new();
     materials.reserve_exact(total_recipients);
+    let mut public_keys: Vec<[u8; 32]> = Vec::new();
+    public_keys.reserve_exact(recipient_pubkeys.len());
 
     for key_path in recipient_keys {
         let keyfile = read_keyfile(key_path)?;
         materials.push((WrapType::Keyfile, keyfile.key));
+    }
+
+    for pubkey_path in recipient_pubkeys {
+        let pubkey = read_public_keyfile(pubkey_path)?;
+        public_keys.push(pubkey.key);
     }
 
     if recipient_password {
@@ -382,19 +470,37 @@ fn cmd_enc(
         materials.push((WrapType::Password, password_bytes));
     }
 
-    let mut recipients: Vec<RecipientSpec<'_>> = Vec::with_capacity(materials.len());
-    for (index, (recipient_type, material)) in materials.iter().enumerate() {
+    let mut recipients: Vec<RecipientSpec<'_>> =
+        Vec::with_capacity(materials.len() + public_keys.len());
+    let mut next_id = 1u32;
+    for (recipient_type, material) in &materials {
         recipients.push(RecipientSpec {
-            recipient_id: (index as u32) + 1,
+            recipient_id: next_id,
             recipient_type: *recipient_type,
-            key_material: material.as_slice(),
+            key_material: Some(material.as_slice()),
+            public_key: None,
         });
+        next_id = next_id.saturating_add(1);
+    }
+
+    for pubkey in &public_keys {
+        recipients.push(RecipientSpec {
+            recipient_id: next_id,
+            recipient_type: WrapType::PublicKey,
+            key_material: None,
+            public_key: Some(*pubkey),
+        });
+        next_id = next_id.saturating_add(1);
     }
 
     let tmp_path = temp_path_for(output);
     let mut output_file = File::create(&tmp_path)?;
 
-    let _written = write_encrypted_container_v3(&mut output_file, &mut chunks, &recipients)?;
+    if recipient_pubkeys.is_empty() {
+        let _written = write_encrypted_container_v3(&mut output_file, &mut chunks, &recipients)?;
+    } else {
+        let _written = write_encrypted_container_v4(&mut output_file, &mut chunks, &recipients)?;
+    }
 
     finalize_output(&tmp_path, output)?;
     Ok(())
@@ -404,149 +510,330 @@ fn cmd_list_recipients(input: &Path) -> Result<(), CliError> {
     let mut file = File::open(input)?;
     let (header, _) = read_header(&mut file)?;
 
-    if header.version != ACF_VERSION_V3 {
+    if header.version != ACF_VERSION_V3 && header.version != ACF_VERSION_V4 {
         return Err(CliError::Cli(
-            "recipients are only available in v3 containers".to_string(),
+            "recipients are only available in v3/v4 containers".to_string(),
         ));
     }
 
     let recipients = match header.crypto.as_ref() {
         Some(CryptoHeader::V3 { recipients, .. }) => recipients,
+        Some(CryptoHeader::V4 { recipients, .. }) => recipients,
         _ => return Err(CliError::Format(FormatError::MissingCryptoHeader)),
     };
 
     println!("Recipients:");
     for recipient in recipients {
-        println!(
-            "  - id: {} type: {:?} wrap: {:?} wrapped: {} bytes",
-            recipient.recipient_id,
-            recipient.recipient_type,
-            recipient.wrap_alg,
-            recipient.wrapped_key.len()
-        );
+        if recipient.recipient_type == WrapType::PublicKey {
+            let pubkey = recipient
+                .recipient_pubkey
+                .as_ref()
+                .map(|bytes| to_hex(bytes))
+                .unwrap_or_else(|| "<missing>".to_string());
+            let ephemeral = recipient
+                .ephemeral_pubkey
+                .as_ref()
+                .map(|bytes| to_hex(bytes))
+                .unwrap_or_else(|| "<missing>".to_string());
+            println!(
+                "  - id: {} type: {:?} wrap: {:?} wrapped: {} bytes pubkey: {} eph: {}",
+                recipient.recipient_id,
+                recipient.recipient_type,
+                recipient.wrap_alg,
+                recipient.wrapped_key.len(),
+                pubkey,
+                ephemeral
+            );
+        } else {
+            println!(
+                "  - id: {} type: {:?} wrap: {:?} wrapped: {} bytes",
+                recipient.recipient_id,
+                recipient.recipient_type,
+                recipient.wrap_alg,
+                recipient.wrapped_key.len()
+            );
+        }
     }
 
     Ok(())
 }
 
-fn cmd_rotate(
-    input: &Path,
-    output: &Path,
-    auth_key: Option<&Path>,
+struct RotateArgs<'a> {
+    input: &'a Path,
+    output: &'a Path,
+    auth_key: Option<&'a Path>,
+    auth_private_key: Option<&'a Path>,
     auth_password: bool,
-    add_recipient_keys: &[PathBuf],
+    add_recipient_keys: &'a [PathBuf],
+    add_recipient_pubkeys: &'a [PathBuf],
     add_recipient_password: bool,
-    remove_recipient_ids: &[u32],
-) -> Result<(), CliError> {
-    if add_recipient_keys.is_empty() && !add_recipient_password && remove_recipient_ids.is_empty() {
+    remove_recipient_ids: &'a [u32],
+}
+
+fn cmd_rotate(args: RotateArgs<'_>) -> Result<(), CliError> {
+    let RotateArgs {
+        input,
+        output,
+        auth_key,
+        auth_private_key,
+        auth_password,
+        add_recipient_keys,
+        add_recipient_pubkeys,
+        add_recipient_password,
+        remove_recipient_ids,
+    } = args;
+    if add_recipient_keys.is_empty()
+        && add_recipient_pubkeys.is_empty()
+        && !add_recipient_password
+        && remove_recipient_ids.is_empty()
+    {
         return Err(CliError::Cli(
-            "rotation requires --add-recipient-key, --add-recipient-password, or --remove-recipient"
-                .to_string(),
+            "rotation requires add/remove recipient options".to_string(),
         ));
     }
 
     let mut header_file = File::open(input)?;
     let (header, _) = read_header(&mut header_file)?;
 
-    if header.version != ACF_VERSION_V3 {
-        return Err(CliError::Cli(
-            "rotation only supports v3 containers".to_string(),
-        ));
-    }
+    match header.version {
+        ACF_VERSION_V3 => {
+            if auth_private_key.is_some() || !add_recipient_pubkeys.is_empty() {
+                return Err(CliError::Cli(
+                    "v3 rotation does not support public key recipients".to_string(),
+                ));
+            }
 
-    let recipients = match header.crypto.as_ref() {
-        Some(CryptoHeader::V3 { recipients, .. }) => recipients,
-        _ => return Err(CliError::Format(FormatError::MissingCryptoHeader)),
-    };
+            let recipients = match header.crypto.as_ref() {
+                Some(CryptoHeader::V3 { recipients, .. }) => recipients,
+                _ => return Err(CliError::Format(FormatError::MissingCryptoHeader)),
+            };
 
-    let has_key = recipients
-        .iter()
-        .any(|recipient| recipient.recipient_type == WrapType::Keyfile);
-    let has_password = recipients
-        .iter()
-        .any(|recipient| recipient.recipient_type == WrapType::Password);
+            let has_key = recipients
+                .iter()
+                .any(|recipient| recipient.recipient_type == WrapType::Keyfile);
+            let has_password = recipients
+                .iter()
+                .any(|recipient| recipient.recipient_type == WrapType::Password);
 
-    let mode = resolve_auth_mode(auth_key, auth_password)?;
-    match &mode {
-        AuthMode::Keyfile(_) if !has_key => {
-            return Err(CliError::Cli(
-                "container expects a password, not a key file".to_string(),
-            ))
+            let mode = resolve_auth_mode(auth_key, None, auth_password)?;
+            match &mode {
+                AuthMode::Keyfile(_) if !has_key => {
+                    return Err(CliError::Cli(
+                        "container expects a password, not a key file".to_string(),
+                    ))
+                }
+                AuthMode::Password if !has_password => {
+                    return Err(CliError::Cli(
+                        "container expects a key file, not a password".to_string(),
+                    ))
+                }
+                AuthMode::PrivateKey(_) => {
+                    return Err(CliError::Cli(
+                        "v3 rotation does not support private keys".to_string(),
+                    ))
+                }
+                _ => {}
+            }
+
+            let add_count = add_recipient_keys.len() + if add_recipient_password { 1 } else { 0 };
+            let mut add_materials: Vec<(WrapType, Zeroizing<Vec<u8>>)> = Vec::new();
+            add_materials.reserve_exact(add_count);
+            let mut add_specs: Vec<RecipientSpec<'_>> = Vec::with_capacity(add_count);
+            let next_id = recipients
+                .iter()
+                .map(|recipient| recipient.recipient_id)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+
+            for key_path in add_recipient_keys {
+                let keyfile = read_keyfile(key_path)?;
+                add_materials.push((WrapType::Keyfile, keyfile.key));
+            }
+
+            if add_recipient_password {
+                let password_bytes = read_password(true)?;
+                add_materials.push((WrapType::Password, password_bytes));
+            }
+
+            for (offset, (recipient_type, material)) in add_materials.iter().enumerate() {
+                let recipient_id = next_id.saturating_add(offset as u32);
+                add_specs.push(RecipientSpec {
+                    recipient_id,
+                    recipient_type: *recipient_type,
+                    key_material: Some(material.as_slice()),
+                    public_key: None,
+                });
+            }
+
+            let (auth_wrap_type, auth_material) = match mode {
+                AuthMode::Keyfile(path) => (WrapType::Keyfile, read_keyfile(path)?.key),
+                AuthMode::Password => (WrapType::Password, read_password(false)?),
+                AuthMode::PrivateKey(_) => {
+                    return Err(CliError::Cli(
+                        "v3 rotation does not support private keys".to_string(),
+                    ))
+                }
+            };
+
+            info!(
+                input = %input.display(),
+                output = %output.display(),
+                "rotating recipients"
+            );
+
+            let tmp_path = temp_path_for(output);
+            let mut output_file = File::create(&tmp_path)?;
+            let mut input_file = File::open(input)?;
+
+            let result = rotate_container_v3(
+                &mut input_file,
+                &mut output_file,
+                auth_material.as_slice(),
+                auth_wrap_type,
+                &add_specs,
+                remove_recipient_ids,
+            );
+            if result.is_err() {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            result?;
+
+            finalize_output(&tmp_path, output)?;
+            Ok(())
         }
-        AuthMode::Password if !has_password => {
-            return Err(CliError::Cli(
-                "container expects a key file, not a password".to_string(),
-            ))
+        ACF_VERSION_V4 => {
+            let recipients = match header.crypto.as_ref() {
+                Some(CryptoHeader::V4 { recipients, .. }) => recipients,
+                _ => return Err(CliError::Format(FormatError::MissingCryptoHeader)),
+            };
+
+            let has_key = recipients
+                .iter()
+                .any(|recipient| recipient.recipient_type == WrapType::Keyfile);
+            let has_password = recipients
+                .iter()
+                .any(|recipient| recipient.recipient_type == WrapType::Password);
+            let has_public = recipients
+                .iter()
+                .any(|recipient| recipient.recipient_type == WrapType::PublicKey);
+
+            let mode = resolve_auth_mode(auth_key, auth_private_key, auth_password)?;
+            match &mode {
+                AuthMode::Keyfile(_) if !has_key => {
+                    return Err(CliError::Cli(
+                        "container expects a password or private key, not a key file".to_string(),
+                    ))
+                }
+                AuthMode::Password if !has_password => {
+                    return Err(CliError::Cli(
+                        "container expects a key file or private key, not a password".to_string(),
+                    ))
+                }
+                AuthMode::PrivateKey(_) if !has_public => {
+                    return Err(CliError::Cli(
+                        "container expects a key file or password, not a private key".to_string(),
+                    ))
+                }
+                _ => {}
+            }
+
+            let mut add_materials: Vec<(WrapType, Zeroizing<Vec<u8>>)> = Vec::new();
+            add_materials.reserve_exact(
+                add_recipient_keys.len() + if add_recipient_password { 1 } else { 0 },
+            );
+            for key_path in add_recipient_keys {
+                let keyfile = read_keyfile(key_path)?;
+                add_materials.push((WrapType::Keyfile, keyfile.key));
+            }
+            if add_recipient_password {
+                let password_bytes = read_password(true)?;
+                add_materials.push((WrapType::Password, password_bytes));
+            }
+
+            let mut add_public_keys: Vec<[u8; 32]> = Vec::new();
+            add_public_keys.reserve_exact(add_recipient_pubkeys.len());
+            for pubkey_path in add_recipient_pubkeys {
+                let pubkey = read_public_keyfile(pubkey_path)?;
+                add_public_keys.push(pubkey.key);
+            }
+
+            let total_add = add_materials.len() + add_public_keys.len();
+            let mut add_specs: Vec<RecipientSpec<'_>> = Vec::with_capacity(total_add);
+            let mut next_id = recipients
+                .iter()
+                .map(|recipient| recipient.recipient_id)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+
+            for (recipient_type, material) in &add_materials {
+                add_specs.push(RecipientSpec {
+                    recipient_id: next_id,
+                    recipient_type: *recipient_type,
+                    key_material: Some(material.as_slice()),
+                    public_key: None,
+                });
+                next_id = next_id.saturating_add(1);
+            }
+
+            for pubkey in &add_public_keys {
+                add_specs.push(RecipientSpec {
+                    recipient_id: next_id,
+                    recipient_type: WrapType::PublicKey,
+                    key_material: None,
+                    public_key: Some(*pubkey),
+                });
+                next_id = next_id.saturating_add(1);
+            }
+
+            let (auth_wrap_type, auth_material) = match mode {
+                AuthMode::Keyfile(path) => (WrapType::Keyfile, read_keyfile(path)?.key),
+                AuthMode::Password => (WrapType::Password, read_password(false)?),
+                AuthMode::PrivateKey(path) => {
+                    let keyfile = read_private_keyfile(path)?;
+                    let key_vec = Zeroizing::new(keyfile.key.as_ref().to_vec());
+                    (WrapType::PublicKey, key_vec)
+                }
+            };
+
+            info!(
+                input = %input.display(),
+                output = %output.display(),
+                "rotating recipients"
+            );
+
+            let tmp_path = temp_path_for(output);
+            let mut output_file = File::create(&tmp_path)?;
+            let mut input_file = File::open(input)?;
+
+            let result = rotate_container_v4(
+                &mut input_file,
+                &mut output_file,
+                auth_material.as_slice(),
+                auth_wrap_type,
+                &add_specs,
+                remove_recipient_ids,
+            );
+            if result.is_err() {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            result?;
+
+            finalize_output(&tmp_path, output)?;
+            Ok(())
         }
-        _ => {}
+        _ => Err(CliError::Cli(
+            "rotation only supports v3/v4 containers".to_string(),
+        )),
     }
-
-    let add_count = add_recipient_keys.len() + if add_recipient_password { 1 } else { 0 };
-    let mut add_materials: Vec<(WrapType, Zeroizing<Vec<u8>>)> = Vec::new();
-    add_materials.reserve_exact(add_count);
-    let mut add_specs: Vec<RecipientSpec<'_>> = Vec::with_capacity(add_count);
-    let next_id = recipients
-        .iter()
-        .map(|recipient| recipient.recipient_id)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1);
-
-    for key_path in add_recipient_keys {
-        let keyfile = read_keyfile(key_path)?;
-        add_materials.push((WrapType::Keyfile, keyfile.key));
-    }
-
-    if add_recipient_password {
-        let password_bytes = read_password(true)?;
-        add_materials.push((WrapType::Password, password_bytes));
-    }
-
-    for (offset, (recipient_type, material)) in add_materials.iter().enumerate() {
-        let recipient_id = next_id.saturating_add(offset as u32);
-        add_specs.push(RecipientSpec {
-            recipient_id,
-            recipient_type: *recipient_type,
-            key_material: material.as_slice(),
-        });
-    }
-
-    let (auth_wrap_type, auth_material) = match mode {
-        AuthMode::Keyfile(path) => (WrapType::Keyfile, read_keyfile(path)?.key),
-        AuthMode::Password => (WrapType::Password, read_password(false)?),
-    };
-
-    info!(
-        input = %input.display(),
-        output = %output.display(),
-        "rotating recipients"
-    );
-
-    let tmp_path = temp_path_for(output);
-    let mut output_file = File::create(&tmp_path)?;
-    let mut input_file = File::open(input)?;
-
-    let result = rotate_container_v3(
-        &mut input_file,
-        &mut output_file,
-        auth_material.as_slice(),
-        auth_wrap_type,
-        &add_specs,
-        remove_recipient_ids,
-    );
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-    result?;
-
-    finalize_output(&tmp_path, output)?;
-    Ok(())
 }
 
 fn cmd_dec(
     input: &Path,
     output: &Path,
     recipient_key: Option<&Path>,
+    private_key: Option<&Path>,
     recipient_password: bool,
 ) -> Result<(), CliError> {
     let mut header_file = File::open(input)?;
@@ -554,9 +841,9 @@ fn cmd_dec(
 
     match header.version {
         aegis_format::ACF_VERSION_V1 => {
-            if recipient_password {
+            if recipient_password || private_key.is_some() {
                 return Err(CliError::Cli(
-                    "v1 containers require a key file, not a password".to_string(),
+                    "v1 containers require a key file, not a password or private key".to_string(),
                 ));
             }
             let key_path = recipient_key.ok_or_else(|| {
@@ -594,9 +881,10 @@ fn cmd_dec(
 
             match wrap_type {
                 WrapType::Keyfile => {
-                    if recipient_password {
+                    if recipient_password || private_key.is_some() {
                         return Err(CliError::Cli(
-                            "container expects a key file, not a password".to_string(),
+                            "container expects a key file, not a password or private key"
+                                .to_string(),
                         ));
                     }
                     let key_path = recipient_key.ok_or_else(|| {
@@ -630,9 +918,10 @@ fn cmd_dec(
                     Ok(())
                 }
                 WrapType::Password => {
-                    if recipient_key.is_some() {
+                    if recipient_key.is_some() || private_key.is_some() {
                         return Err(CliError::Cli(
-                            "container expects a password, not a key file".to_string(),
+                            "container expects a password, not a key file or private key"
+                                .to_string(),
                         ));
                     }
                     if !recipient_password {
@@ -666,6 +955,9 @@ fn cmd_dec(
                     finalize_output(&tmp_path, output)?;
                     Ok(())
                 }
+                WrapType::PublicKey => Err(CliError::Cli(
+                    "v2 containers do not support public key recipients".to_string(),
+                )),
             }
         }
         ACF_VERSION_V3 => {
@@ -681,7 +973,12 @@ fn cmd_dec(
                 .iter()
                 .any(|recipient| recipient.recipient_type == WrapType::Password);
 
-            let mode = resolve_mode(recipient_key, recipient_password)?;
+            if private_key.is_some() {
+                return Err(CliError::Cli(
+                    "v3 containers do not support private key recipients".to_string(),
+                ));
+            }
+            let mode = resolve_mode(recipient_key, None, recipient_password)?;
 
             match mode {
                 AuthMode::Keyfile(key_path) => {
@@ -741,6 +1038,131 @@ fn cmd_dec(
                         &mut output_file,
                         password_bytes.as_slice(),
                         WrapType::Password,
+                    );
+                    if result.is_err() {
+                        let _ = std::fs::remove_file(&tmp_path);
+                    }
+                    result?;
+                    finalize_output(&tmp_path, output)?;
+                    Ok(())
+                }
+                AuthMode::PrivateKey(_) => Err(CliError::Cli(
+                    "v3 containers do not support private key recipients".to_string(),
+                )),
+            }
+        }
+        ACF_VERSION_V4 => {
+            let recipients = match header.crypto.as_ref() {
+                Some(CryptoHeader::V4 { recipients, .. }) => recipients,
+                _ => return Err(CliError::Format(FormatError::MissingCryptoHeader)),
+            };
+
+            let has_key = recipients
+                .iter()
+                .any(|recipient| recipient.recipient_type == WrapType::Keyfile);
+            let has_password = recipients
+                .iter()
+                .any(|recipient| recipient.recipient_type == WrapType::Password);
+            let has_public = recipients
+                .iter()
+                .any(|recipient| recipient.recipient_type == WrapType::PublicKey);
+
+            let mode = resolve_mode(recipient_key, private_key, recipient_password)?;
+
+            match mode {
+                AuthMode::Keyfile(key_path) => {
+                    if !has_key {
+                        return Err(CliError::Cli(
+                            "container expects a password or private key, not a key file"
+                                .to_string(),
+                        ));
+                    }
+
+                    info!(
+                        input = %input.display(),
+                        output = %output.display(),
+                        key = %key_path.display(),
+                        "decrypting container"
+                    );
+
+                    let keyfile = read_keyfile(key_path)?;
+                    let mut input_file = File::open(input)?;
+
+                    let tmp_path = temp_path_for(output);
+                    let mut output_file = File::create(&tmp_path)?;
+
+                    let result = decrypt_container_v4(
+                        &mut input_file,
+                        &mut output_file,
+                        keyfile.key.as_slice(),
+                        WrapType::Keyfile,
+                    );
+                    if result.is_err() {
+                        let _ = std::fs::remove_file(&tmp_path);
+                    }
+                    result?;
+                    finalize_output(&tmp_path, output)?;
+                    Ok(())
+                }
+                AuthMode::Password => {
+                    if !has_password {
+                        return Err(CliError::Cli(
+                            "container expects a key file or private key, not a password"
+                                .to_string(),
+                        ));
+                    }
+
+                    info!(
+                        input = %input.display(),
+                        output = %output.display(),
+                        "decrypting container"
+                    );
+
+                    let password_bytes = read_password(false)?;
+                    let mut input_file = File::open(input)?;
+
+                    let tmp_path = temp_path_for(output);
+                    let mut output_file = File::create(&tmp_path)?;
+
+                    let result = decrypt_container_v4(
+                        &mut input_file,
+                        &mut output_file,
+                        password_bytes.as_slice(),
+                        WrapType::Password,
+                    );
+                    if result.is_err() {
+                        let _ = std::fs::remove_file(&tmp_path);
+                    }
+                    result?;
+                    finalize_output(&tmp_path, output)?;
+                    Ok(())
+                }
+                AuthMode::PrivateKey(key_path) => {
+                    if !has_public {
+                        return Err(CliError::Cli(
+                            "container expects a key file or password, not a private key"
+                                .to_string(),
+                        ));
+                    }
+
+                    info!(
+                        input = %input.display(),
+                        output = %output.display(),
+                        key = %key_path.display(),
+                        "decrypting container"
+                    );
+
+                    let keyfile = read_private_keyfile(key_path)?;
+                    let mut input_file = File::open(input)?;
+
+                    let tmp_path = temp_path_for(output);
+                    let mut output_file = File::create(&tmp_path)?;
+
+                    let result = decrypt_container_v4(
+                        &mut input_file,
+                        &mut output_file,
+                        keyfile.key.as_ref(),
+                        WrapType::PublicKey,
                     );
                     if result.is_err() {
                         let _ = std::fs::remove_file(&tmp_path);
@@ -883,4 +1305,70 @@ fn print_v3_details(header: &aegis_format::FileHeader) {
         return;
     }
     println!("  Missing crypto header");
+}
+
+fn print_v4_details(header: &aegis_format::FileHeader) {
+    println!("Encryption (v4):");
+    if let Some(CryptoHeader::V4 {
+        cipher_id,
+        kdf_id,
+        kdf_params,
+        salt,
+        nonce,
+        recipients,
+    }) = header.crypto.as_ref()
+    {
+        println!("  Cipher: {:?}", cipher_id);
+        println!("  KDF: {:?}", kdf_id);
+        println!(
+            "  KDF params: mem={} KiB, iterations={}, parallelism={}",
+            kdf_params.memory_kib, kdf_params.iterations, kdf_params.parallelism
+        );
+        println!("  Salt length: {} bytes", salt.len());
+        println!("  Nonce length: {} bytes", nonce.len());
+        println!("  Recipients: {}", recipients.len());
+        for recipient in recipients {
+            if recipient.recipient_type == WrapType::PublicKey {
+                let pubkey = recipient
+                    .recipient_pubkey
+                    .as_ref()
+                    .map(|bytes| to_hex(bytes))
+                    .unwrap_or_else(|| "<missing>".to_string());
+                let ephemeral = recipient
+                    .ephemeral_pubkey
+                    .as_ref()
+                    .map(|bytes| to_hex(bytes))
+                    .unwrap_or_else(|| "<missing>".to_string());
+                println!(
+                    "  - id: {} type: {:?} wrap: {:?} wrapped: {} bytes pubkey: {} eph: {}",
+                    recipient.recipient_id,
+                    recipient.recipient_type,
+                    recipient.wrap_alg,
+                    recipient.wrapped_key.len(),
+                    pubkey,
+                    ephemeral
+                );
+            } else {
+                println!(
+                    "  - id: {} type: {:?} wrap: {:?} wrapped: {} bytes",
+                    recipient.recipient_id,
+                    recipient.recipient_type,
+                    recipient.wrap_alg,
+                    recipient.wrapped_key.len()
+                );
+            }
+        }
+        println!("  Payload: encrypted");
+        return;
+    }
+    println!("  Missing crypto header");
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02X}");
+    }
+    out
 }

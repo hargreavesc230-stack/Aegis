@@ -1,10 +1,12 @@
 use std::io::Cursor;
 
+use aegis_core::crypto::public_key::generate_keypair;
 use aegis_format::{
-    decrypt_container_v2, decrypt_container_v3, read_header, rotate_container_v3,
-    write_encrypted_container, write_encrypted_container_password, write_encrypted_container_v3,
-    ChunkType, CryptoHeader, FormatError, RecipientSpec, WrapType, WriteChunkSource,
-    ACF_VERSION_V2, HEADER_BASE_LEN,
+    decrypt_container_v2, decrypt_container_v3, decrypt_container_v4, read_header,
+    rotate_container_v3, write_encrypted_container, write_encrypted_container_password,
+    write_encrypted_container_v3, write_encrypted_container_v4, ChunkType, CryptoHeader,
+    FormatError, RecipientSpec, WrapType, WriteChunkSource, ACF_VERSION_V2, ACF_VERSION_V4,
+    HEADER_BASE_LEN, RECIPIENT_PUBLIC_KEY_LEN,
 };
 use aegis_testkit::{flip_byte, sample_bytes};
 
@@ -252,12 +254,14 @@ fn multi_recipient_roundtrip_keyfile_password() {
         RecipientSpec {
             recipient_id: 1,
             recipient_type: WrapType::Keyfile,
-            key_material: &key,
+            key_material: Some(&key),
+            public_key: None,
         },
         RecipientSpec {
             recipient_id: 2,
             recipient_type: WrapType::Password,
-            key_material: password,
+            key_material: Some(password),
+            public_key: None,
         },
     ];
 
@@ -296,12 +300,14 @@ fn multi_recipient_wrong_credentials_rejected() {
         RecipientSpec {
             recipient_id: 10,
             recipient_type: WrapType::Keyfile,
-            key_material: &key,
+            key_material: Some(&key),
+            public_key: None,
         },
         RecipientSpec {
             recipient_id: 11,
             recipient_type: WrapType::Password,
-            key_material: password,
+            key_material: Some(password),
+            public_key: None,
         },
     ];
 
@@ -340,12 +346,14 @@ fn recipient_removal_invalidates_old_credentials() {
         RecipientSpec {
             recipient_id: 1,
             recipient_type: WrapType::Keyfile,
-            key_material: &key_a,
+            key_material: Some(&key_a),
+            public_key: None,
         },
         RecipientSpec {
             recipient_id: 2,
             recipient_type: WrapType::Keyfile,
-            key_material: &key_b,
+            key_material: Some(&key_b),
+            public_key: None,
         },
     ];
 
@@ -397,12 +405,14 @@ fn rotation_preserves_payload() {
         RecipientSpec {
             recipient_id: 5,
             recipient_type: WrapType::Keyfile,
-            key_material: &key_a,
+            key_material: Some(&key_a),
+            public_key: None,
         },
         RecipientSpec {
             recipient_id: 6,
             recipient_type: WrapType::Keyfile,
-            key_material: &key_b,
+            key_material: Some(&key_b),
+            public_key: None,
         },
     ];
 
@@ -413,7 +423,8 @@ fn rotation_preserves_payload() {
     let add_specs = vec![RecipientSpec {
         recipient_id: 7,
         recipient_type: WrapType::Keyfile,
-        key_material: &new_key,
+        key_material: Some(&new_key),
+        public_key: None,
     }];
 
     let mut rotated = Vec::new();
@@ -447,7 +458,8 @@ fn tampered_recipient_entry_rejected() {
     let recipients = vec![RecipientSpec {
         recipient_id: 1,
         recipient_type: WrapType::Keyfile,
-        key_material: &key,
+        key_material: Some(&key),
+        public_key: None,
     }];
 
     let mut container = Vec::new();
@@ -464,5 +476,179 @@ fn tampered_recipient_entry_rejected() {
         WrapType::Keyfile,
     )
     .expect_err("tampered recipient should fail");
+    assert!(matches!(err, FormatError::Crypto(_)));
+}
+
+#[test]
+fn public_key_roundtrip() {
+    let (private_key, public_key) = generate_keypair().expect("keypair");
+    let data = sample_bytes(512);
+    let mut chunks = vec![make_chunk(1, ChunkType::Data, data.clone())];
+
+    let recipients = vec![RecipientSpec {
+        recipient_id: 1,
+        recipient_type: WrapType::PublicKey,
+        key_material: None,
+        public_key: Some(public_key),
+    }];
+
+    let mut container = Vec::new();
+    write_encrypted_container_v4(&mut container, &mut chunks, &recipients).expect("encrypt");
+
+    let mut output = Vec::new();
+    decrypt_container_v4(
+        &mut Cursor::new(container),
+        &mut output,
+        private_key.as_ref(),
+        WrapType::PublicKey,
+    )
+    .expect("decrypt");
+
+    assert_eq!(output, data);
+}
+
+#[test]
+fn public_key_old_private_rejected() {
+    let (private_key, public_key) = generate_keypair().expect("keypair");
+    let (old_private_key, _) = generate_keypair().expect("old keypair");
+    let data = sample_bytes(256);
+    let mut chunks = vec![make_chunk(1, ChunkType::Data, data)];
+
+    let recipients = vec![RecipientSpec {
+        recipient_id: 1,
+        recipient_type: WrapType::PublicKey,
+        key_material: None,
+        public_key: Some(public_key),
+    }];
+
+    let mut container = Vec::new();
+    write_encrypted_container_v4(&mut container, &mut chunks, &recipients).expect("encrypt");
+
+    let err = decrypt_container_v4(
+        &mut Cursor::new(container.clone()),
+        &mut Vec::new(),
+        old_private_key.as_ref(),
+        WrapType::PublicKey,
+    )
+    .expect_err("old key should fail");
+    assert!(matches!(err, FormatError::Crypto(_)));
+
+    let mut output = Vec::new();
+    decrypt_container_v4(
+        &mut Cursor::new(container),
+        &mut output,
+        private_key.as_ref(),
+        WrapType::PublicKey,
+    )
+    .expect("new key works");
+}
+
+#[test]
+fn mixed_recipients_v4_roundtrip() {
+    let (private_key, public_key) = generate_keypair().expect("keypair");
+    let keyfile = vec![0x42u8; 32];
+    let password = b"mixed-pass";
+    let data = sample_bytes(1024);
+    let mut chunks = vec![make_chunk(1, ChunkType::Data, data.clone())];
+
+    let recipients = vec![
+        RecipientSpec {
+            recipient_id: 1,
+            recipient_type: WrapType::Keyfile,
+            key_material: Some(&keyfile),
+            public_key: None,
+        },
+        RecipientSpec {
+            recipient_id: 2,
+            recipient_type: WrapType::Password,
+            key_material: Some(password),
+            public_key: None,
+        },
+        RecipientSpec {
+            recipient_id: 3,
+            recipient_type: WrapType::PublicKey,
+            key_material: None,
+            public_key: Some(public_key),
+        },
+    ];
+
+    let mut container = Vec::new();
+    write_encrypted_container_v4(&mut container, &mut chunks, &recipients).expect("encrypt");
+
+    let mut out_key = Vec::new();
+    decrypt_container_v4(
+        &mut Cursor::new(container.clone()),
+        &mut out_key,
+        &keyfile,
+        WrapType::Keyfile,
+    )
+    .expect("keyfile decrypt");
+    assert_eq!(out_key, data);
+
+    let mut out_pw = Vec::new();
+    decrypt_container_v4(
+        &mut Cursor::new(container.clone()),
+        &mut out_pw,
+        password,
+        WrapType::Password,
+    )
+    .expect("password decrypt");
+    assert_eq!(out_pw, data);
+
+    let mut out_pub = Vec::new();
+    decrypt_container_v4(
+        &mut Cursor::new(container),
+        &mut out_pub,
+        private_key.as_ref(),
+        WrapType::PublicKey,
+    )
+    .expect("public decrypt");
+    assert_eq!(out_pub, data);
+}
+
+#[test]
+fn corrupted_ephemeral_pubkey_rejected() {
+    let (private_key, public_key) = generate_keypair().expect("keypair");
+    let data = sample_bytes(256);
+    let mut chunks = vec![make_chunk(1, ChunkType::Data, data)];
+
+    let recipients = vec![RecipientSpec {
+        recipient_id: 1,
+        recipient_type: WrapType::PublicKey,
+        key_material: None,
+        public_key: Some(public_key),
+    }];
+
+    let mut container = Vec::new();
+    write_encrypted_container_v4(&mut container, &mut chunks, &recipients).expect("encrypt");
+
+    let (header, _) = read_header(&mut Cursor::new(&container)).expect("header");
+    assert_eq!(header.version, ACF_VERSION_V4);
+
+    let salt_len = match header.crypto.as_ref() {
+        Some(CryptoHeader::V4 { salt, .. }) => salt.len(),
+        _ => panic!("expected v4 header"),
+    };
+
+    let nonce_len = match header.crypto.as_ref() {
+        Some(CryptoHeader::V4 { nonce, .. }) => nonce.len(),
+        _ => panic!("expected v4 header"),
+    };
+
+    let mut offset = HEADER_BASE_LEN + 2 + 2 + 4 + 4 + 4 + 2;
+    offset += salt_len;
+    offset += 2;
+    offset += nonce_len;
+    offset += 2;
+    offset += 4 + 2 + 2 + RECIPIENT_PUBLIC_KEY_LEN;
+    flip_byte(&mut container, offset);
+
+    let err = decrypt_container_v4(
+        &mut Cursor::new(container),
+        &mut Vec::new(),
+        private_key.as_ref(),
+        WrapType::PublicKey,
+    )
+    .expect_err("ephemeral tamper should fail");
     assert!(matches!(err, FormatError::Crypto(_)));
 }

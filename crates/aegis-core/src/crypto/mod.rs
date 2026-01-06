@@ -7,6 +7,7 @@ pub mod aead;
 pub mod ids;
 pub mod kdf;
 pub mod keyfile;
+pub mod public_key;
 pub mod wrap;
 
 #[derive(Debug, Error)]
@@ -25,6 +26,18 @@ pub enum CryptoError {
     InvalidKeyFileLength(u16),
     #[error("key file length too large: {0}")]
     KeyFileTooLarge(usize),
+    #[error("invalid public key file magic")]
+    InvalidPublicKeyMagic { found: [u8; 4] },
+    #[error("unsupported public key file version: {0}")]
+    UnsupportedPublicKeyVersion(u16),
+    #[error("invalid public key length: {0}")]
+    InvalidPublicKeyLength(u16),
+    #[error("invalid private key file magic")]
+    InvalidPrivateKeyMagic { found: [u8; 4] },
+    #[error("unsupported private key file version: {0}")]
+    UnsupportedPrivateKeyVersion(u16),
+    #[error("invalid private key length: {0}")]
+    InvalidPrivateKeyLength(u16),
     #[error("invalid wrapped key data")]
     InvalidWrappedKey,
     #[error("invalid wrap nonce length: expected {expected}, found {found}")]
@@ -33,6 +46,8 @@ pub enum CryptoError {
     Argon2(argon2::Error),
     #[error("authentication failed")]
     AuthFailed,
+    #[error("hkdf error")]
+    Hkdf,
     #[error("truncated input")]
     Truncated,
     #[error("unsupported cipher id: {0}")]

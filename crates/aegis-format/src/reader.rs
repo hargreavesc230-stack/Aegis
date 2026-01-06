@@ -2,16 +2,20 @@ use std::io::{self, Read, Write};
 
 use aegis_core::crypto::aead::{encrypt_stream, DecryptReader};
 use aegis_core::crypto::kdf::KdfParams;
+use aegis_core::crypto::public_key::{
+    derive_wrapping_key, generate_keypair, public_key_from_private, X25519_KEY_LEN,
+};
 use aegis_core::crypto::wrap::{unwrap_key, unwrap_key_with_aad, wrap_key_with_aad};
 use aegis_core::io_ext::read_exact_or_err;
 use aegis_core::Crc32;
 use zeroize::Zeroizing;
 
 use crate::acf::{
-    encode_chunk_entry, encode_header, parse_header, recipient_aad, ChecksumType, ChunkEntry,
-    ChunkType, CryptoHeader, FileHeader, FooterV0, FooterV1, FormatError, RecipientEntry,
-    V3HeaderParams, WrapType, ACF_VERSION_V0, ACF_VERSION_V1, ACF_VERSION_V2, ACF_VERSION_V3,
-    CHUNK_LEN, FOOTER_MAGIC, FOOTER_V1_LEN, HEADER_BASE_LEN, MAX_HEADER_LEN,
+    encode_chunk_entry, encode_header, parse_header, recipient_aad, recipient_aad_v4, ChecksumType,
+    ChunkEntry, ChunkType, CryptoHeader, FileHeader, FooterV0, FooterV1, FormatError,
+    RecipientEntry, V3HeaderParams, V4HeaderParams, WrapType, ACF_VERSION_V0, ACF_VERSION_V1,
+    ACF_VERSION_V2, ACF_VERSION_V3, ACF_VERSION_V4, CHUNK_LEN, FOOTER_MAGIC, FOOTER_V1_LEN,
+    HEADER_BASE_LEN, MAX_HEADER_LEN,
 };
 use crate::validate::{validate_chunks, validate_header};
 use crate::writer::{RecipientSpec, WrittenEncryptedContainer};
@@ -292,6 +296,9 @@ pub fn decrypt_container_v3<R: Read, W: Write>(
     key_material: &[u8],
     recipient_type: WrapType,
 ) -> Result<DecryptedContainer, FormatError> {
+    if recipient_type == WrapType::PublicKey {
+        return Err(FormatError::UnsupportedWrapType(WrapType::PublicKey as u16));
+    }
     let (header, header_bytes) = read_header(reader)?;
     if header.version != ACF_VERSION_V3 {
         return Err(FormatError::UnsupportedVersion(header.version));
@@ -395,6 +402,115 @@ pub fn decrypt_container_v3<R: Read, W: Write>(
     })
 }
 
+pub fn decrypt_container_v4<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    key_material: &[u8],
+    recipient_type: WrapType,
+) -> Result<DecryptedContainer, FormatError> {
+    let (header, header_bytes) = read_header(reader)?;
+    if header.version != ACF_VERSION_V4 {
+        return Err(FormatError::UnsupportedVersion(header.version));
+    }
+    validate_header(&header)?;
+
+    let (kdf_params, salt, nonce, recipients) = match header
+        .crypto
+        .as_ref()
+        .ok_or(FormatError::MissingCryptoHeader)?
+    {
+        CryptoHeader::V4 {
+            kdf_params,
+            salt,
+            nonce,
+            recipients,
+            ..
+        } => (kdf_params, salt, nonce, recipients),
+        _ => return Err(FormatError::MissingCryptoHeader),
+    };
+
+    let kdf_params = KdfParams {
+        memory_kib: kdf_params.memory_kib,
+        iterations: kdf_params.iterations,
+        parallelism: kdf_params.parallelism,
+        output_len: aegis_core::crypto::aead::AEAD_KEY_LEN,
+    };
+
+    let data_key = select_data_key_v4(recipients, key_material, recipient_type, kdf_params, salt)?;
+
+    let mut decrypt_reader = DecryptReader::new(reader, data_key.as_slice(), nonce, &header_bytes)?;
+
+    let mut chunks = Vec::with_capacity(header.chunk_count as usize);
+    for _ in 0..header.chunk_count {
+        let mut entry_buf = [0u8; CHUNK_LEN];
+        read_exact_plaintext(&mut decrypt_reader, &mut entry_buf)?;
+
+        let chunk_id = u32::from_le_bytes([entry_buf[0], entry_buf[1], entry_buf[2], entry_buf[3]]);
+        let chunk_type_raw = u16::from_le_bytes([entry_buf[4], entry_buf[5]]);
+        let flags = u16::from_le_bytes([entry_buf[6], entry_buf[7]]);
+        let offset = u64::from_le_bytes([
+            entry_buf[8],
+            entry_buf[9],
+            entry_buf[10],
+            entry_buf[11],
+            entry_buf[12],
+            entry_buf[13],
+            entry_buf[14],
+            entry_buf[15],
+        ]);
+        let length = u64::from_le_bytes([
+            entry_buf[16],
+            entry_buf[17],
+            entry_buf[18],
+            entry_buf[19],
+            entry_buf[20],
+            entry_buf[21],
+            entry_buf[22],
+            entry_buf[23],
+        ]);
+
+        let chunk_type = ChunkType::try_from(chunk_type_raw)?;
+
+        chunks.push(ChunkEntry {
+            chunk_id,
+            chunk_type,
+            flags,
+            offset,
+            length,
+        });
+    }
+
+    let _data_start = validate_chunks(&header, &chunks)?;
+
+    let mut data_chunk_seen = false;
+    for chunk in &chunks {
+        if chunk.chunk_type == ChunkType::Data {
+            if data_chunk_seen {
+                return Err(FormatError::MultipleDataChunks);
+            }
+            data_chunk_seen = true;
+            if chunk.length > 0 {
+                copy_exact_plaintext(&mut decrypt_reader, writer, chunk.length)?;
+            }
+        } else if chunk.length > 0 {
+            skip_exact_plaintext(&mut decrypt_reader, chunk.length)?;
+        }
+    }
+
+    if !data_chunk_seen {
+        return Err(FormatError::MissingDataChunk);
+    }
+
+    let footer = read_footer_v1(&mut decrypt_reader)?;
+    ensure_plaintext_eof(&mut decrypt_reader)?;
+
+    Ok(DecryptedContainer {
+        header,
+        chunks,
+        footer,
+    })
+}
+
 pub fn rotate_container_v3<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -403,6 +519,9 @@ pub fn rotate_container_v3<R: Read, W: Write>(
     add_recipients: &[RecipientSpec<'_>],
     remove_ids: &[u32],
 ) -> Result<WrittenEncryptedContainer, FormatError> {
+    if recipient_type == WrapType::PublicKey {
+        return Err(FormatError::UnsupportedWrapType(WrapType::PublicKey as u16));
+    }
     let (header, header_bytes) = read_header(reader)?;
     if header.version != ACF_VERSION_V3 {
         return Err(FormatError::UnsupportedVersion(header.version));
@@ -457,12 +576,17 @@ pub fn rotate_container_v3<R: Read, W: Write>(
     let mut id_set: std::collections::HashSet<u32> =
         new_recipients.iter().map(|r| r.recipient_id).collect();
     for recipient in add_recipients {
+        if recipient.recipient_type == WrapType::PublicKey || recipient.public_key.is_some() {
+            return Err(FormatError::UnsupportedWrapType(WrapType::PublicKey as u16));
+        }
         if !id_set.insert(recipient.recipient_id) {
             return Err(FormatError::DuplicateRecipientId(recipient.recipient_id));
         }
 
-        let derived =
-            aegis_core::crypto::kdf::derive_key(recipient.key_material, salt, kdf_params)?;
+        let key_material = recipient
+            .key_material
+            .ok_or(FormatError::MissingRecipientKeyMaterial)?;
+        let derived = aegis_core::crypto::kdf::derive_key(key_material, salt, kdf_params)?;
         let wrap_alg = crate::acf::WrapAlg::XChaCha20Poly1305;
         let aad = recipient_aad(recipient.recipient_id, recipient.recipient_type, wrap_alg);
         let wrapped_key = wrap_key_with_aad(derived.as_slice(), data_key.as_slice(), &aad)?;
@@ -471,6 +595,8 @@ pub fn rotate_container_v3<R: Read, W: Write>(
             recipient_type: recipient.recipient_type,
             wrap_alg,
             wrapped_key,
+            recipient_pubkey: None,
+            ephemeral_pubkey: None,
         });
     }
 
@@ -550,6 +676,315 @@ pub fn rotate_container_v3<R: Read, W: Write>(
                 .as_ref()
                 .and_then(|crypto| match crypto {
                     CryptoHeader::V3 { kdf_id, .. } => Some(*kdf_id),
+                    _ => None,
+                })
+                .ok_or(FormatError::MissingCryptoHeader)?,
+            kdf_params: crate::acf::KdfParamsHeader {
+                memory_kib: kdf_params.memory_kib,
+                iterations: kdf_params.iterations,
+                parallelism: kdf_params.parallelism,
+            },
+            salt: salt.clone(),
+            nonce: nonce.clone(),
+            recipients: new_recipients,
+        },
+    )?;
+
+    validate_header(&new_header)?;
+    validate_chunks(&new_header, &new_entries)?;
+
+    let header_bytes = encode_header(&new_header)?;
+    writer.write_all(&header_bytes)?;
+
+    let mut new_table_bytes = Vec::with_capacity(new_entries.len() * CHUNK_LEN);
+    for entry in &new_entries {
+        new_table_bytes.extend_from_slice(&encode_chunk_entry(entry));
+    }
+
+    let total_data_len: u64 = chunks.iter().map(|chunk| chunk.length).sum();
+    let mut payload = RotatePayloadReader::new(
+        &new_table_bytes,
+        &mut decrypt_reader,
+        total_data_len,
+        FOOTER_V1_LEN as usize,
+    );
+
+    encrypt_stream(
+        &mut payload,
+        writer,
+        data_key.as_slice(),
+        nonce,
+        &header_bytes,
+    )?;
+
+    ensure_plaintext_eof(&mut decrypt_reader)?;
+
+    Ok(WrittenEncryptedContainer {
+        header: new_header,
+        chunks: new_entries,
+        footer: FooterV1::new(),
+    })
+}
+
+pub fn rotate_container_v4<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    key_material: &[u8],
+    recipient_type: WrapType,
+    add_recipients: &[RecipientSpec<'_>],
+    remove_ids: &[u32],
+) -> Result<WrittenEncryptedContainer, FormatError> {
+    let (header, header_bytes) = read_header(reader)?;
+    if header.version != ACF_VERSION_V4 {
+        return Err(FormatError::UnsupportedVersion(header.version));
+    }
+    validate_header(&header)?;
+
+    let (kdf_params, salt, nonce, existing_recipients) = match header
+        .crypto
+        .as_ref()
+        .ok_or(FormatError::MissingCryptoHeader)?
+    {
+        CryptoHeader::V4 {
+            kdf_params,
+            salt,
+            nonce,
+            recipients,
+            ..
+        } => (kdf_params, salt, nonce, recipients),
+        _ => return Err(FormatError::MissingCryptoHeader),
+    };
+
+    let kdf_params = KdfParams {
+        memory_kib: kdf_params.memory_kib,
+        iterations: kdf_params.iterations,
+        parallelism: kdf_params.parallelism,
+        output_len: aegis_core::crypto::aead::AEAD_KEY_LEN,
+    };
+
+    let data_key = select_data_key_v4(
+        existing_recipients,
+        key_material,
+        recipient_type,
+        kdf_params,
+        salt,
+    )?;
+
+    let existing_ids: std::collections::HashSet<u32> = existing_recipients
+        .iter()
+        .map(|recipient| recipient.recipient_id)
+        .collect();
+    let remove_set: std::collections::HashSet<u32> = remove_ids.iter().copied().collect();
+    for remove_id in &remove_set {
+        if !existing_ids.contains(remove_id) {
+            return Err(FormatError::RecipientIdNotFound(*remove_id));
+        }
+    }
+
+    let mut id_set: std::collections::HashSet<u32> = existing_ids
+        .iter()
+        .copied()
+        .filter(|id| !remove_set.contains(id))
+        .collect();
+
+    let mut will_have_public = existing_recipients
+        .iter()
+        .any(|recipient| recipient.recipient_type == WrapType::PublicKey);
+    if add_recipients
+        .iter()
+        .any(|recipient| recipient.recipient_type == WrapType::PublicKey)
+    {
+        will_have_public = true;
+    }
+
+    let mut ephemeral_private = None;
+    let mut ephemeral_public = None;
+    if will_have_public {
+        let (private, public) = generate_keypair()?;
+        // The ephemeral private key is zeroized when it goes out of scope.
+        ephemeral_private = Some(private);
+        ephemeral_public = Some(public);
+    }
+
+    let mut new_recipients = Vec::with_capacity(
+        existing_recipients
+            .len()
+            .saturating_add(add_recipients.len()),
+    );
+    for recipient in existing_recipients {
+        if remove_set.contains(&recipient.recipient_id) {
+            continue;
+        }
+
+        if recipient.recipient_type == WrapType::PublicKey {
+            let recipient_pubkey = *recipient
+                .recipient_pubkey
+                .as_ref()
+                .ok_or(FormatError::MissingRecipientPublicKey)?;
+            let private_key = ephemeral_private
+                .as_ref()
+                .ok_or(FormatError::MissingRecipientEphemeralKey)?;
+            let ephemeral_pub = *ephemeral_public
+                .as_ref()
+                .ok_or(FormatError::MissingRecipientEphemeralKey)?;
+            let derived = derive_wrapping_key(private_key, &recipient_pubkey)?;
+            let aad = recipient_aad_v4(
+                recipient.recipient_id,
+                recipient.recipient_type,
+                recipient.wrap_alg,
+                Some(&recipient_pubkey),
+                Some(&ephemeral_pub),
+            );
+            let wrapped_key = wrap_key_with_aad(derived.as_slice(), data_key.as_slice(), &aad)?;
+            new_recipients.push(RecipientEntry {
+                recipient_id: recipient.recipient_id,
+                recipient_type: recipient.recipient_type,
+                wrap_alg: recipient.wrap_alg,
+                wrapped_key,
+                recipient_pubkey: Some(recipient_pubkey),
+                ephemeral_pubkey: Some(ephemeral_pub),
+            });
+        } else {
+            new_recipients.push(recipient.clone());
+        }
+    }
+
+    for recipient in add_recipients {
+        if !id_set.insert(recipient.recipient_id) {
+            return Err(FormatError::DuplicateRecipientId(recipient.recipient_id));
+        }
+
+        let wrap_alg = crate::acf::WrapAlg::XChaCha20Poly1305;
+        match recipient.recipient_type {
+            WrapType::Keyfile | WrapType::Password => {
+                let key_material = recipient
+                    .key_material
+                    .ok_or(FormatError::MissingRecipientKeyMaterial)?;
+                let derived = aegis_core::crypto::kdf::derive_key(key_material, salt, kdf_params)?;
+                let aad = recipient_aad_v4(
+                    recipient.recipient_id,
+                    recipient.recipient_type,
+                    wrap_alg,
+                    None,
+                    None,
+                );
+                let wrapped_key = wrap_key_with_aad(derived.as_slice(), data_key.as_slice(), &aad)?;
+                new_recipients.push(RecipientEntry {
+                    recipient_id: recipient.recipient_id,
+                    recipient_type: recipient.recipient_type,
+                    wrap_alg,
+                    wrapped_key,
+                    recipient_pubkey: None,
+                    ephemeral_pubkey: None,
+                });
+            }
+            WrapType::PublicKey => {
+                let public_key = recipient
+                    .public_key
+                    .ok_or(FormatError::MissingRecipientPublicKey)?;
+                let private_key = ephemeral_private
+                    .as_ref()
+                    .ok_or(FormatError::MissingRecipientEphemeralKey)?;
+                let ephemeral_pub = *ephemeral_public
+                    .as_ref()
+                    .ok_or(FormatError::MissingRecipientEphemeralKey)?;
+                let derived = derive_wrapping_key(private_key, &public_key)?;
+                let aad = recipient_aad_v4(
+                    recipient.recipient_id,
+                    recipient.recipient_type,
+                    wrap_alg,
+                    Some(&public_key),
+                    Some(&ephemeral_pub),
+                );
+                let wrapped_key = wrap_key_with_aad(derived.as_slice(), data_key.as_slice(), &aad)?;
+                new_recipients.push(RecipientEntry {
+                    recipient_id: recipient.recipient_id,
+                    recipient_type: recipient.recipient_type,
+                    wrap_alg,
+                    wrapped_key,
+                    recipient_pubkey: Some(public_key),
+                    ephemeral_pubkey: Some(ephemeral_pub),
+                });
+            }
+        }
+    }
+
+    if new_recipients.is_empty() {
+        return Err(FormatError::MissingRecipients);
+    }
+
+    let mut decrypt_reader = DecryptReader::new(reader, data_key.as_slice(), nonce, &header_bytes)?;
+
+    let table_len = (header.chunk_count as usize)
+        .checked_mul(CHUNK_LEN)
+        .ok_or(FormatError::ChunkCountTooLarge)?;
+    let mut table_bytes = vec![0u8; table_len];
+    read_exact_plaintext(&mut decrypt_reader, &mut table_bytes)?;
+
+    let mut chunks = Vec::with_capacity(header.chunk_count as usize);
+    for entry in table_bytes.chunks_exact(CHUNK_LEN) {
+        let chunk_id = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+        let chunk_type_raw = u16::from_le_bytes([entry[4], entry[5]]);
+        let flags = u16::from_le_bytes([entry[6], entry[7]]);
+        let offset = u64::from_le_bytes([
+            entry[8], entry[9], entry[10], entry[11], entry[12], entry[13], entry[14], entry[15],
+        ]);
+        let length = u64::from_le_bytes([
+            entry[16], entry[17], entry[18], entry[19], entry[20], entry[21], entry[22], entry[23],
+        ]);
+        let chunk_type = ChunkType::try_from(chunk_type_raw)?;
+        chunks.push(ChunkEntry {
+            chunk_id,
+            chunk_type,
+            flags,
+            offset,
+            length,
+        });
+    }
+
+    validate_chunks(&header, &chunks)?;
+
+    let mut new_entries = Vec::with_capacity(chunks.len());
+    let new_header_len = crate::acf::header_len_v4(salt, nonce, &new_recipients)? as u64;
+    let new_data_start = new_header_len
+        .checked_add(table_len as u64)
+        .ok_or(FormatError::ChunkCountTooLarge)?;
+    let mut offset = new_data_start;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let next_offset =
+            offset
+                .checked_add(chunk.length)
+                .ok_or(FormatError::ChunkLengthOverflow {
+                    index: index as u32,
+                })?;
+        new_entries.push(ChunkEntry {
+            chunk_id: chunk.chunk_id,
+            chunk_type: chunk.chunk_type,
+            flags: chunk.flags,
+            offset,
+            length: chunk.length,
+        });
+        offset = next_offset;
+    }
+
+    let footer_offset = offset;
+    let new_header = FileHeader::new_v4(
+        header.chunk_count,
+        footer_offset,
+        V4HeaderParams {
+            cipher_id: header
+                .crypto
+                .as_ref()
+                .and_then(|crypto| match crypto {
+                    CryptoHeader::V4 { cipher_id, .. } => Some(*cipher_id),
+                    _ => None,
+                })
+                .ok_or(FormatError::MissingCryptoHeader)?,
+            kdf_id: header
+                .crypto
+                .as_ref()
+                .and_then(|crypto| match crypto {
+                    CryptoHeader::V4 { kdf_id, .. } => Some(*kdf_id),
                     _ => None,
                 })
                 .ok_or(FormatError::MissingCryptoHeader)?,
@@ -717,6 +1152,108 @@ fn select_data_key_v3(
             Err(err) => {
                 if !matches!(err, aegis_core::crypto::CryptoError::AuthFailed) {
                     return Err(FormatError::Crypto(err));
+                }
+            }
+        }
+    }
+
+    if !has_candidate {
+        return Err(FormatError::RecipientTypeNotFound);
+    }
+
+    Err(FormatError::Crypto(
+        aegis_core::crypto::CryptoError::AuthFailed,
+    ))
+}
+
+fn select_data_key_v4(
+    recipients: &[RecipientEntry],
+    key_material: &[u8],
+    recipient_type: WrapType,
+    kdf_params: KdfParams,
+    salt: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, FormatError> {
+    let mut has_candidate = false;
+    let mut derived: Option<Zeroizing<Vec<u8>>> = None;
+    let mut private_key = None;
+
+    if recipient_type == WrapType::PublicKey {
+        if key_material.len() != X25519_KEY_LEN {
+            return Err(FormatError::Crypto(
+                aegis_core::crypto::CryptoError::InvalidKeyLength {
+                    expected: X25519_KEY_LEN,
+                    found: key_material.len(),
+                },
+            ));
+        }
+        let mut key_bytes = [0u8; X25519_KEY_LEN];
+        key_bytes.copy_from_slice(key_material);
+        private_key = Some(key_bytes);
+    }
+
+    for recipient in recipients {
+        if recipient.recipient_type != recipient_type {
+            continue;
+        }
+        has_candidate = true;
+
+        match recipient_type {
+            WrapType::Keyfile | WrapType::Password => {
+                if derived.is_none() {
+                    derived = Some(aegis_core::crypto::kdf::derive_key(
+                        key_material,
+                        salt,
+                        kdf_params,
+                    )?);
+                }
+                let derived = derived.as_ref().ok_or(FormatError::MissingCryptoHeader)?;
+                let aad = recipient_aad_v4(
+                    recipient.recipient_id,
+                    recipient.recipient_type,
+                    recipient.wrap_alg,
+                    None,
+                    None,
+                );
+                match unwrap_key_with_aad(derived.as_slice(), &recipient.wrapped_key, &aad) {
+                    Ok(key) => return Ok(key),
+                    Err(err) => {
+                        if !matches!(err, aegis_core::crypto::CryptoError::AuthFailed) {
+                            return Err(FormatError::Crypto(err));
+                        }
+                    }
+                }
+            }
+            WrapType::PublicKey => {
+                let private_key = private_key
+                    .as_ref()
+                    .ok_or(FormatError::MissingRecipientKeyMaterial)?;
+                let recipient_pubkey = recipient
+                    .recipient_pubkey
+                    .as_ref()
+                    .ok_or(FormatError::MissingRecipientPublicKey)?;
+                let ephemeral_pubkey = recipient
+                    .ephemeral_pubkey
+                    .as_ref()
+                    .ok_or(FormatError::MissingRecipientEphemeralKey)?;
+                let computed_pubkey = public_key_from_private(private_key);
+                if &computed_pubkey != recipient_pubkey {
+                    continue;
+                }
+                let derived = derive_wrapping_key(private_key, ephemeral_pubkey)?;
+                let aad = recipient_aad_v4(
+                    recipient.recipient_id,
+                    recipient.recipient_type,
+                    recipient.wrap_alg,
+                    Some(recipient_pubkey),
+                    Some(ephemeral_pubkey),
+                );
+                match unwrap_key_with_aad(derived.as_slice(), &recipient.wrapped_key, &aad) {
+                    Ok(key) => return Ok(key),
+                    Err(err) => {
+                        if !matches!(err, aegis_core::crypto::CryptoError::AuthFailed) {
+                            return Err(FormatError::Crypto(err));
+                        }
+                    }
                 }
             }
         }
