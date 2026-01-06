@@ -78,6 +78,9 @@ coverage/
 *.aegis
 *.osf
 
+!examples/**/*.aegis
+!examples/**/*.key
+
 # =========================
 # Local scripts
 # =========================
