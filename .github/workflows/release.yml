@@ -24,6 +24,10 @@ jobs:
         shell: pwsh
         run: cargo generate-lockfile
 
+      - name: Fetch dependencies
+        shell: pwsh
+        run: cargo fetch
+
       - name: Build targets
         shell: pwsh
         run: |
@@ -36,7 +40,7 @@ jobs:
           }
           New-Item -ItemType Directory -Force dist | Out-Null
           foreach ($t in $targets) {
-            cargo build --release --locked --target $t -p aegis-cli -p aegis-fuzzlite
+            cargo build --release --offline --target $t -p aegis-cli -p aegis-fuzzlite
             $binDir = "target/$t/release"
             Copy-Item "$binDir/aegis-cli.exe" "dist/aegis-cli-$t.exe"
             Copy-Item "$binDir/aegis-fuzzlite.exe" "dist/aegis-fuzzlite-$t.exe"
@@ -66,6 +70,9 @@ jobs:
       - name: Generate Cargo.lock
         run: cargo generate-lockfile
 
+      - name: Fetch dependencies
+        run: cargo fetch
+
       - name: Install cross toolchain
         run: |
           sudo apt-get update
@@ -85,7 +92,7 @@ jobs:
           mkdir -p dist
           export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
           for t in "${targets[@]}"; do
-            cargo build --release --locked --target "$t" -p aegis-cli -p aegis-fuzzlite
+            cargo build --release --offline --target "$t" -p aegis-cli -p aegis-fuzzlite
             bin_dir="target/$t/release"
             cp "$bin_dir/aegis-cli" "dist/aegis-cli-$t"
             cp "$bin_dir/aegis-fuzzlite" "dist/aegis-fuzzlite-$t"
@@ -114,6 +121,9 @@ jobs:
       - name: Generate Cargo.lock
         run: cargo generate-lockfile
 
+      - name: Fetch dependencies
+        run: cargo fetch
+
       - name: Build targets
         shell: bash
         run: |
@@ -127,7 +137,7 @@ jobs:
           done
           mkdir -p dist
           for t in "${targets[@]}"; do
-            cargo build --release --locked --target "$t" -p aegis-cli -p aegis-fuzzlite
+            cargo build --release --offline --target "$t" -p aegis-cli -p aegis-fuzzlite
             bin_dir="target/$t/release"
             cp "$bin_dir/aegis-cli" "dist/aegis-cli-$t"
             cp "$bin_dir/aegis-fuzzlite" "dist/aegis-fuzzlite-$t"
