@@ -1399,13 +1399,7 @@ fn print_json_inspect(path: &Path, header: &aegis_format::FileHeader) -> Result<
                     nonce,
                 }) = header.crypto.as_ref()
                 {
-                    json_field_str(
-                        &mut out,
-                        2,
-                        "cipher_id",
-                        &format!("{cipher_id:?}"),
-                        true,
-                    );
+                    json_field_str(&mut out, 2, "cipher_id", &format!("{cipher_id:?}"), true);
                     json_field_str(&mut out, 2, "kdf_id", &format!("{kdf_id:?}"), true);
                     json_field_u64(&mut out, 2, "salt_len", salt.len() as u64, true);
                     json_field_u64(&mut out, 2, "nonce_len", nonce.len() as u64, true);
@@ -1425,24 +1419,12 @@ fn print_json_inspect(path: &Path, header: &aegis_format::FileHeader) -> Result<
                     wrapped_key,
                 }) = header.crypto.as_ref()
                 {
-                    json_field_str(
-                        &mut out,
-                        2,
-                        "cipher_id",
-                        &format!("{cipher_id:?}"),
-                        true,
-                    );
+                    json_field_str(&mut out, 2, "cipher_id", &format!("{cipher_id:?}"), true);
                     json_field_str(&mut out, 2, "kdf_id", &format!("{kdf_id:?}"), true);
                     json_field_kdf_params(&mut out, 2, kdf_params, true);
                     json_field_u64(&mut out, 2, "salt_len", salt.len() as u64, true);
                     json_field_u64(&mut out, 2, "nonce_len", nonce.len() as u64, true);
-                    json_field_str(
-                        &mut out,
-                        2,
-                        "wrap_type",
-                        &format!("{wrap_type:?}"),
-                        true,
-                    );
+                    json_field_str(&mut out, 2, "wrap_type", &format!("{wrap_type:?}"), true);
                     json_field_u64(
                         &mut out,
                         2,
@@ -1465,13 +1447,7 @@ fn print_json_inspect(path: &Path, header: &aegis_format::FileHeader) -> Result<
                     recipients,
                 }) = header.crypto.as_ref()
                 {
-                    json_field_str(
-                        &mut out,
-                        2,
-                        "cipher_id",
-                        &format!("{cipher_id:?}"),
-                        true,
-                    );
+                    json_field_str(&mut out, 2, "cipher_id", &format!("{cipher_id:?}"), true);
                     json_field_str(&mut out, 2, "kdf_id", &format!("{kdf_id:?}"), true);
                     json_field_kdf_params(&mut out, 2, kdf_params, true);
                     json_field_u64(&mut out, 2, "salt_len", salt.len() as u64, true);
@@ -1492,13 +1468,7 @@ fn print_json_inspect(path: &Path, header: &aegis_format::FileHeader) -> Result<
                     recipients,
                 }) = header.crypto.as_ref()
                 {
-                    json_field_str(
-                        &mut out,
-                        2,
-                        "cipher_id",
-                        &format!("{cipher_id:?}"),
-                        true,
-                    );
+                    json_field_str(&mut out, 2, "cipher_id", &format!("{cipher_id:?}"), true);
                     json_field_str(&mut out, 2, "kdf_id", &format!("{kdf_id:?}"), true);
                     json_field_kdf_params(&mut out, 2, kdf_params, true);
                     json_field_u64(&mut out, 2, "salt_len", salt.len() as u64, true);
@@ -1591,20 +1561,8 @@ fn json_field_kdf_params(
 ) {
     json_key(out, depth, "kdf_params");
     out.push_str("{\n");
-    json_field_u64(
-        out,
-        depth + 1,
-        "memory_kib",
-        params.memory_kib as u64,
-        true,
-    );
-    json_field_u64(
-        out,
-        depth + 1,
-        "iterations",
-        params.iterations as u64,
-        true,
-    );
+    json_field_u64(out, depth + 1, "memory_kib", params.memory_kib as u64, true);
+    json_field_u64(out, depth + 1, "iterations", params.iterations as u64, true);
     json_field_u64(
         out,
         depth + 1,
@@ -1668,13 +1626,7 @@ fn json_field_checksum(
 ) {
     json_key(out, depth, "checksum");
     out.push_str("{\n");
-    json_field_str(
-        out,
-        depth + 1,
-        "type",
-        &format!("{checksum_type:?}"),
-        true,
-    );
+    json_field_str(out, depth + 1, "type", &format!("{checksum_type:?}"), true);
     json_field_u64(out, depth + 1, "expected", expected as u64, true);
     json_field_u64(out, depth + 1, "computed", computed as u64, true);
     json_field_bool(out, depth + 1, "valid", valid, false);
@@ -1741,7 +1693,13 @@ fn json_field_recipients(
             );
         }
         if let Some(ephemeral) = recipient.ephemeral_pubkey.as_ref() {
-            json_field_str(out, depth + 2, "ephemeral_pubkey", &to_hex(ephemeral), false);
+            json_field_str(
+                out,
+                depth + 2,
+                "ephemeral_pubkey",
+                &to_hex(ephemeral),
+                false,
+            );
         }
 
         json_indent(out, depth + 1);
