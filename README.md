@@ -115,6 +115,7 @@ cargo run -p aegis-cli -- dec C:\path\to\output.aegis C:\path\to\roundtrip.bin -
 
 ```
 cargo run -p aegis-cli -- inspect C:\path\to\container.aegis
+cargo run -p aegis-cli -- inspect C:\path\to\container.aegis --json
 ```
 
 ### Examples
@@ -199,6 +200,9 @@ cargo run -p aegis-fuzzlite -- --iters 1000 --max-len 4096
 ```
 :: Inspect a container (with checksum verification)
 cargo run -p aegis-cli -- inspect C:\path\to\container.aegis
+
+:: Inspect as JSON (stable field order)
+cargo run -p aegis-cli -- inspect C:\path\to\container.aegis --json
 
 :: Pack data into a container
 cargo run -p aegis-cli -- pack C:\path\to\input.bin C:\path\to\output.aegis

@@ -1,6 +1,7 @@
 #![deny(warnings)]
 #![deny(clippy::all)]
 
+use std::fmt::Write;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -41,7 +42,11 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Inspect a container header and checksum status
-    Inspect { path: PathBuf },
+    Inspect {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Pack a container from input data (v0, no encryption)
     Pack {
         input: PathBuf,
@@ -158,7 +163,7 @@ fn run() -> i32 {
     };
 
     let result = match cli.command {
-        Commands::Inspect { path } => cmd_inspect(&path),
+        Commands::Inspect { path, json } => cmd_inspect(&path, json),
         Commands::Pack {
             input,
             output,
@@ -272,11 +277,16 @@ fn map_exit_code(err: &CliError) -> i32 {
     }
 }
 
-fn cmd_inspect(path: &Path) -> Result<(), CliError> {
+fn cmd_inspect(path: &Path, json: bool) -> Result<(), CliError> {
     info!(path = %path.display(), "reading container");
 
     let mut file = File::open(path)?;
     let (header, _) = read_header(&mut file)?;
+
+    if json {
+        print_json_inspect(path, &header)?;
+        return Ok(());
+    }
 
     print_header(path, &header);
 
@@ -1344,6 +1354,409 @@ fn print_header(path: &Path, header: &aegis_format::FileHeader) {
     println!("  Chunk count: {}", header.chunk_count);
     println!("  Chunk table offset: {} bytes", header.chunk_table_offset);
     println!("  Footer offset: {} bytes", header.footer_offset);
+}
+
+fn print_json_inspect(path: &Path, header: &aegis_format::FileHeader) -> Result<(), CliError> {
+    let mut out = String::new();
+    out.push_str("{\n");
+    json_field_str(&mut out, 1, "path", &path.display().to_string(), true);
+    json_field_u64(&mut out, 1, "version", header.version as u64, true);
+    json_field_u64(&mut out, 1, "header_len", header.header_len as u64, true);
+    json_field_u64(&mut out, 1, "flags", header.flags as u64, true);
+    json_field_u64(&mut out, 1, "chunk_count", header.chunk_count as u64, true);
+    json_field_u64(
+        &mut out,
+        1,
+        "chunk_table_offset",
+        header.chunk_table_offset,
+        true,
+    );
+    json_field_u64(&mut out, 1, "footer_offset", header.footer_offset, true);
+
+    if header.version == aegis_format::ACF_VERSION_V0 {
+        let mut file = File::open(path)?;
+        let parsed = read_container_with_status(&mut file)?;
+        json_field_chunks(&mut out, 1, &parsed.chunks, true);
+        json_field_checksum(
+            &mut out,
+            1,
+            parsed.footer.checksum_type,
+            parsed.footer.checksum,
+            parsed.computed_checksum,
+            parsed.checksum_valid,
+            false,
+        );
+    } else {
+        json_indent(&mut out, 1);
+        json_string(&mut out, "encryption");
+        out.push_str(": {\n");
+        match header.version {
+            aegis_format::ACF_VERSION_V1 => {
+                if let Some(CryptoHeader::V1 {
+                    cipher_id,
+                    kdf_id,
+                    salt,
+                    nonce,
+                }) = header.crypto.as_ref()
+                {
+                    json_field_str(
+                        &mut out,
+                        2,
+                        "cipher_id",
+                        &format!("{cipher_id:?}"),
+                        true,
+                    );
+                    json_field_str(&mut out, 2, "kdf_id", &format!("{kdf_id:?}"), true);
+                    json_field_u64(&mut out, 2, "salt_len", salt.len() as u64, true);
+                    json_field_u64(&mut out, 2, "nonce_len", nonce.len() as u64, true);
+                    json_field_bool(&mut out, 2, "payload_encrypted", true, false);
+                } else {
+                    json_field_bool(&mut out, 2, "missing", true, false);
+                }
+            }
+            ACF_VERSION_V2 => {
+                if let Some(CryptoHeader::V2 {
+                    cipher_id,
+                    kdf_id,
+                    kdf_params,
+                    salt,
+                    nonce,
+                    wrap_type,
+                    wrapped_key,
+                }) = header.crypto.as_ref()
+                {
+                    json_field_str(
+                        &mut out,
+                        2,
+                        "cipher_id",
+                        &format!("{cipher_id:?}"),
+                        true,
+                    );
+                    json_field_str(&mut out, 2, "kdf_id", &format!("{kdf_id:?}"), true);
+                    json_field_kdf_params(&mut out, 2, kdf_params, true);
+                    json_field_u64(&mut out, 2, "salt_len", salt.len() as u64, true);
+                    json_field_u64(&mut out, 2, "nonce_len", nonce.len() as u64, true);
+                    json_field_str(
+                        &mut out,
+                        2,
+                        "wrap_type",
+                        &format!("{wrap_type:?}"),
+                        true,
+                    );
+                    json_field_u64(
+                        &mut out,
+                        2,
+                        "wrapped_key_len",
+                        wrapped_key.len() as u64,
+                        true,
+                    );
+                    json_field_bool(&mut out, 2, "payload_encrypted", true, false);
+                } else {
+                    json_field_bool(&mut out, 2, "missing", true, false);
+                }
+            }
+            ACF_VERSION_V3 => {
+                if let Some(CryptoHeader::V3 {
+                    cipher_id,
+                    kdf_id,
+                    kdf_params,
+                    salt,
+                    nonce,
+                    recipients,
+                }) = header.crypto.as_ref()
+                {
+                    json_field_str(
+                        &mut out,
+                        2,
+                        "cipher_id",
+                        &format!("{cipher_id:?}"),
+                        true,
+                    );
+                    json_field_str(&mut out, 2, "kdf_id", &format!("{kdf_id:?}"), true);
+                    json_field_kdf_params(&mut out, 2, kdf_params, true);
+                    json_field_u64(&mut out, 2, "salt_len", salt.len() as u64, true);
+                    json_field_u64(&mut out, 2, "nonce_len", nonce.len() as u64, true);
+                    json_field_recipients(&mut out, 2, recipients, true);
+                    json_field_bool(&mut out, 2, "payload_encrypted", true, false);
+                } else {
+                    json_field_bool(&mut out, 2, "missing", true, false);
+                }
+            }
+            ACF_VERSION_V4 => {
+                if let Some(CryptoHeader::V4 {
+                    cipher_id,
+                    kdf_id,
+                    kdf_params,
+                    salt,
+                    nonce,
+                    recipients,
+                }) = header.crypto.as_ref()
+                {
+                    json_field_str(
+                        &mut out,
+                        2,
+                        "cipher_id",
+                        &format!("{cipher_id:?}"),
+                        true,
+                    );
+                    json_field_str(&mut out, 2, "kdf_id", &format!("{kdf_id:?}"), true);
+                    json_field_kdf_params(&mut out, 2, kdf_params, true);
+                    json_field_u64(&mut out, 2, "salt_len", salt.len() as u64, true);
+                    json_field_u64(&mut out, 2, "nonce_len", nonce.len() as u64, true);
+                    json_field_recipients(&mut out, 2, recipients, true);
+                    json_field_bool(&mut out, 2, "payload_encrypted", true, false);
+                } else {
+                    json_field_bool(&mut out, 2, "missing", true, false);
+                }
+            }
+            _ => {
+                json_field_bool(&mut out, 2, "missing", true, false);
+            }
+        }
+        json_indent(&mut out, 1);
+        out.push_str("}\n");
+    }
+
+    out.push_str("}\n");
+    print!("{out}");
+    Ok(())
+}
+
+fn json_indent(out: &mut String, depth: usize) {
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+}
+
+fn json_string(out: &mut String, value: &str) {
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c <= '\u{1f}' => {
+                write!(out, "\\u{:04X}", c as u32).expect("write to string");
+            }
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+}
+
+fn json_key(out: &mut String, depth: usize, key: &str) {
+    json_indent(out, depth);
+    json_string(out, key);
+    out.push_str(": ");
+}
+
+fn json_field_str(out: &mut String, depth: usize, key: &str, value: &str, trailing_comma: bool) {
+    json_key(out, depth, key);
+    json_string(out, value);
+    if trailing_comma {
+        out.push(',');
+    }
+    out.push('\n');
+}
+
+fn json_field_u64(out: &mut String, depth: usize, key: &str, value: u64, trailing_comma: bool) {
+    json_key(out, depth, key);
+    write!(out, "{value}").expect("write to string");
+    if trailing_comma {
+        out.push(',');
+    }
+    out.push('\n');
+}
+
+fn json_field_bool(out: &mut String, depth: usize, key: &str, value: bool, trailing_comma: bool) {
+    json_key(out, depth, key);
+    if value {
+        out.push_str("true");
+    } else {
+        out.push_str("false");
+    }
+    if trailing_comma {
+        out.push(',');
+    }
+    out.push('\n');
+}
+
+fn json_field_kdf_params(
+    out: &mut String,
+    depth: usize,
+    params: &aegis_format::KdfParamsHeader,
+    trailing_comma: bool,
+) {
+    json_key(out, depth, "kdf_params");
+    out.push_str("{\n");
+    json_field_u64(
+        out,
+        depth + 1,
+        "memory_kib",
+        params.memory_kib as u64,
+        true,
+    );
+    json_field_u64(
+        out,
+        depth + 1,
+        "iterations",
+        params.iterations as u64,
+        true,
+    );
+    json_field_u64(
+        out,
+        depth + 1,
+        "parallelism",
+        params.parallelism as u64,
+        false,
+    );
+    json_indent(out, depth);
+    out.push('}');
+    if trailing_comma {
+        out.push(',');
+    }
+    out.push('\n');
+}
+
+fn json_field_chunks(
+    out: &mut String,
+    depth: usize,
+    chunks: &[aegis_format::ChunkEntry],
+    trailing_comma: bool,
+) {
+    json_key(out, depth, "chunks");
+    out.push_str("[\n");
+    for (index, chunk) in chunks.iter().enumerate() {
+        json_indent(out, depth + 1);
+        out.push_str("{\n");
+        json_field_u64(out, depth + 2, "chunk_id", chunk.chunk_id as u64, true);
+        json_field_str(
+            out,
+            depth + 2,
+            "chunk_type",
+            &format!("{:?}", chunk.chunk_type),
+            true,
+        );
+        json_field_u64(out, depth + 2, "flags", chunk.flags as u64, true);
+        json_field_u64(out, depth + 2, "offset", chunk.offset, true);
+        json_field_u64(out, depth + 2, "length", chunk.length, false);
+        json_indent(out, depth + 1);
+        out.push('}');
+        if index + 1 < chunks.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    json_indent(out, depth);
+    out.push(']');
+    if trailing_comma {
+        out.push(',');
+    }
+    out.push('\n');
+}
+
+fn json_field_checksum(
+    out: &mut String,
+    depth: usize,
+    checksum_type: aegis_format::ChecksumType,
+    expected: u32,
+    computed: u32,
+    valid: bool,
+    trailing_comma: bool,
+) {
+    json_key(out, depth, "checksum");
+    out.push_str("{\n");
+    json_field_str(
+        out,
+        depth + 1,
+        "type",
+        &format!("{checksum_type:?}"),
+        true,
+    );
+    json_field_u64(out, depth + 1, "expected", expected as u64, true);
+    json_field_u64(out, depth + 1, "computed", computed as u64, true);
+    json_field_bool(out, depth + 1, "valid", valid, false);
+    json_indent(out, depth);
+    out.push('}');
+    if trailing_comma {
+        out.push(',');
+    }
+    out.push('\n');
+}
+
+fn json_field_recipients(
+    out: &mut String,
+    depth: usize,
+    recipients: &[aegis_format::RecipientEntry],
+    trailing_comma: bool,
+) {
+    json_key(out, depth, "recipients");
+    out.push_str("[\n");
+    for (index, recipient) in recipients.iter().enumerate() {
+        json_indent(out, depth + 1);
+        out.push_str("{\n");
+        json_field_u64(
+            out,
+            depth + 2,
+            "recipient_id",
+            recipient.recipient_id as u64,
+            true,
+        );
+        json_field_str(
+            out,
+            depth + 2,
+            "recipient_type",
+            &format!("{:?}", recipient.recipient_type),
+            true,
+        );
+        json_field_str(
+            out,
+            depth + 2,
+            "wrap_alg",
+            &format!("{:?}", recipient.wrap_alg),
+            true,
+        );
+
+        let has_pubkey = recipient.recipient_pubkey.is_some();
+        let has_ephemeral = recipient.ephemeral_pubkey.is_some();
+        let has_extra = has_pubkey || has_ephemeral;
+
+        json_field_u64(
+            out,
+            depth + 2,
+            "wrapped_key_len",
+            recipient.wrapped_key.len() as u64,
+            has_extra,
+        );
+
+        if let Some(pubkey) = recipient.recipient_pubkey.as_ref() {
+            json_field_str(
+                out,
+                depth + 2,
+                "recipient_pubkey",
+                &to_hex(pubkey),
+                has_ephemeral,
+            );
+        }
+        if let Some(ephemeral) = recipient.ephemeral_pubkey.as_ref() {
+            json_field_str(out, depth + 2, "ephemeral_pubkey", &to_hex(ephemeral), false);
+        }
+
+        json_indent(out, depth + 1);
+        out.push('}');
+        if index + 1 < recipients.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    json_indent(out, depth);
+    out.push(']');
+    if trailing_comma {
+        out.push(',');
+    }
+    out.push('\n');
 }
 
 fn print_v0_details(parsed: &ParsedContainer) {
