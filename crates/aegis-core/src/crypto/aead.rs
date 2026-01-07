@@ -13,6 +13,7 @@ pub const AEAD_KEY_LEN: usize = 32;
 pub const AEAD_NONCE_LEN: usize = 20;
 pub const STREAM_CHUNK_SIZE: usize = 64 * 1024;
 pub const AEAD_TAG_LEN: usize = 16;
+const CIPHER_CHUNK_LEN: usize = STREAM_CHUNK_SIZE + AEAD_TAG_LEN;
 
 type StreamNonce = Nonce<XChaCha20Poly1305, StreamLE31<XChaCha20Poly1305>>;
 
@@ -98,7 +99,8 @@ impl<R: Read> DecryptReader<R> {
             reader,
             decryptor: Some(decryptor),
             aad: aad.to_vec(),
-            cipher_buf: vec![0u8; STREAM_CHUNK_SIZE + AEAD_TAG_LEN],
+            // Allocate an extra byte to read a lookahead without a separate syscall.
+            cipher_buf: vec![0u8; CIPHER_CHUNK_LEN + 1],
             buffer: Zeroizing::new(Vec::new()),
             position: 0,
             done: false,
@@ -160,17 +162,15 @@ impl<R: Read> DecryptReader<R> {
             return Err(CryptoError::Truncated);
         }
 
-        let mut is_last = read < STREAM_CHUNK_SIZE + AEAD_TAG_LEN;
-        if !is_last {
-            let mut probe = [0u8; 1];
-            let n = self.reader.read(&mut probe)?;
-            if n == 0 {
-                is_last = true;
-            } else {
-                self.lookahead = Some(probe[0]);
-            }
-        }
-        let cipher_slice = &cipher_buf[..read];
+        let mut is_last = true;
+        let cipher_len = if read > CIPHER_CHUNK_LEN {
+            is_last = false;
+            self.lookahead = Some(cipher_buf[CIPHER_CHUNK_LEN]);
+            CIPHER_CHUNK_LEN
+        } else {
+            read
+        };
+        let cipher_slice = &cipher_buf[..cipher_len];
         let plaintext = if is_last {
             self.done = true;
             let decryptor = self.decryptor.take().ok_or(CryptoError::Truncated)?;
