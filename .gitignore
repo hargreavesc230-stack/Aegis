@@ -4,6 +4,7 @@
 /target/
 fuzz/
 **/*.rs.bk
+Cargo.lock
 
 # =========================
 # Windows binaries & build artifacts
