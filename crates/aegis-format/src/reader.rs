@@ -85,6 +85,15 @@ pub fn decrypt_container<R: Read, W: Write>(
     writer: &mut W,
     key_material: &[u8],
 ) -> Result<DecryptedContainer, FormatError> {
+    decrypt_container_v1_with_outputs(reader, Some(writer), None, key_material)
+}
+
+pub fn decrypt_container_v1_with_outputs<R: Read>(
+    reader: &mut R,
+    data_out: Option<&mut dyn Write>,
+    metadata_out: Option<&mut dyn Write>,
+    key_material: &[u8],
+) -> Result<DecryptedContainer, FormatError> {
     let (header, header_bytes) = read_header(reader)?;
     if header.version != ACF_VERSION_V1 {
         return Err(FormatError::UnsupportedVersion(header.version));
@@ -104,66 +113,10 @@ pub fn decrypt_container<R: Read, W: Write>(
 
     let mut decrypt_reader = DecryptReader::new(reader, derived.as_slice(), nonce, &header_bytes)?;
 
-    let mut chunks = Vec::with_capacity(header.chunk_count as usize);
-    for _ in 0..header.chunk_count {
-        let mut entry_buf = [0u8; CHUNK_LEN];
-        read_exact_plaintext(&mut decrypt_reader, &mut entry_buf)?;
-
-        let chunk_id = u32::from_le_bytes([entry_buf[0], entry_buf[1], entry_buf[2], entry_buf[3]]);
-        let chunk_type_raw = u16::from_le_bytes([entry_buf[4], entry_buf[5]]);
-        let flags = u16::from_le_bytes([entry_buf[6], entry_buf[7]]);
-        let offset = u64::from_le_bytes([
-            entry_buf[8],
-            entry_buf[9],
-            entry_buf[10],
-            entry_buf[11],
-            entry_buf[12],
-            entry_buf[13],
-            entry_buf[14],
-            entry_buf[15],
-        ]);
-        let length = u64::from_le_bytes([
-            entry_buf[16],
-            entry_buf[17],
-            entry_buf[18],
-            entry_buf[19],
-            entry_buf[20],
-            entry_buf[21],
-            entry_buf[22],
-            entry_buf[23],
-        ]);
-
-        let chunk_type = ChunkType::try_from(chunk_type_raw)?;
-
-        chunks.push(ChunkEntry {
-            chunk_id,
-            chunk_type,
-            flags,
-            offset,
-            length,
-        });
-    }
-
+    let chunks = read_chunk_entries_plaintext(&mut decrypt_reader, &header)?;
     let _data_start = validate_chunks(&header, &chunks)?;
 
-    let mut data_chunk_seen = false;
-    for chunk in &chunks {
-        if chunk.chunk_type == ChunkType::Data {
-            if data_chunk_seen {
-                return Err(FormatError::MultipleDataChunks);
-            }
-            data_chunk_seen = true;
-            if chunk.length > 0 {
-                copy_exact_plaintext(&mut decrypt_reader, writer, chunk.length)?;
-            }
-        } else if chunk.length > 0 {
-            skip_exact_plaintext(&mut decrypt_reader, chunk.length)?;
-        }
-    }
-
-    if !data_chunk_seen {
-        return Err(FormatError::MissingDataChunk);
-    }
+    extract_chunks_plaintext(&mut decrypt_reader, &chunks, data_out, metadata_out)?;
 
     let footer = read_footer_v1(&mut decrypt_reader)?;
     ensure_plaintext_eof(&mut decrypt_reader)?;
@@ -178,6 +131,16 @@ pub fn decrypt_container<R: Read, W: Write>(
 pub fn decrypt_container_v2<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
+    key_material: &[u8],
+    wrap_type: WrapType,
+) -> Result<DecryptedContainer, FormatError> {
+    decrypt_container_v2_with_outputs(reader, Some(writer), None, key_material, wrap_type)
+}
+
+pub fn decrypt_container_v2_with_outputs<R: Read>(
+    reader: &mut R,
+    data_out: Option<&mut dyn Write>,
+    metadata_out: Option<&mut dyn Write>,
     key_material: &[u8],
     wrap_type: WrapType,
 ) -> Result<DecryptedContainer, FormatError> {
@@ -219,66 +182,10 @@ pub fn decrypt_container_v2<R: Read, W: Write>(
 
     let mut decrypt_reader = DecryptReader::new(reader, data_key.as_slice(), nonce, &header_bytes)?;
 
-    let mut chunks = Vec::with_capacity(header.chunk_count as usize);
-    for _ in 0..header.chunk_count {
-        let mut entry_buf = [0u8; CHUNK_LEN];
-        read_exact_plaintext(&mut decrypt_reader, &mut entry_buf)?;
-
-        let chunk_id = u32::from_le_bytes([entry_buf[0], entry_buf[1], entry_buf[2], entry_buf[3]]);
-        let chunk_type_raw = u16::from_le_bytes([entry_buf[4], entry_buf[5]]);
-        let flags = u16::from_le_bytes([entry_buf[6], entry_buf[7]]);
-        let offset = u64::from_le_bytes([
-            entry_buf[8],
-            entry_buf[9],
-            entry_buf[10],
-            entry_buf[11],
-            entry_buf[12],
-            entry_buf[13],
-            entry_buf[14],
-            entry_buf[15],
-        ]);
-        let length = u64::from_le_bytes([
-            entry_buf[16],
-            entry_buf[17],
-            entry_buf[18],
-            entry_buf[19],
-            entry_buf[20],
-            entry_buf[21],
-            entry_buf[22],
-            entry_buf[23],
-        ]);
-
-        let chunk_type = ChunkType::try_from(chunk_type_raw)?;
-
-        chunks.push(ChunkEntry {
-            chunk_id,
-            chunk_type,
-            flags,
-            offset,
-            length,
-        });
-    }
-
+    let chunks = read_chunk_entries_plaintext(&mut decrypt_reader, &header)?;
     let _data_start = validate_chunks(&header, &chunks)?;
 
-    let mut data_chunk_seen = false;
-    for chunk in &chunks {
-        if chunk.chunk_type == ChunkType::Data {
-            if data_chunk_seen {
-                return Err(FormatError::MultipleDataChunks);
-            }
-            data_chunk_seen = true;
-            if chunk.length > 0 {
-                copy_exact_plaintext(&mut decrypt_reader, writer, chunk.length)?;
-            }
-        } else if chunk.length > 0 {
-            skip_exact_plaintext(&mut decrypt_reader, chunk.length)?;
-        }
-    }
-
-    if !data_chunk_seen {
-        return Err(FormatError::MissingDataChunk);
-    }
+    extract_chunks_plaintext(&mut decrypt_reader, &chunks, data_out, metadata_out)?;
 
     let footer = read_footer_v1(&mut decrypt_reader)?;
     ensure_plaintext_eof(&mut decrypt_reader)?;
@@ -293,6 +200,16 @@ pub fn decrypt_container_v2<R: Read, W: Write>(
 pub fn decrypt_container_v3<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
+    key_material: &[u8],
+    recipient_type: WrapType,
+) -> Result<DecryptedContainer, FormatError> {
+    decrypt_container_v3_with_outputs(reader, Some(writer), None, key_material, recipient_type)
+}
+
+pub fn decrypt_container_v3_with_outputs<R: Read>(
+    reader: &mut R,
+    data_out: Option<&mut dyn Write>,
+    metadata_out: Option<&mut dyn Write>,
     key_material: &[u8],
     recipient_type: WrapType,
 ) -> Result<DecryptedContainer, FormatError> {
@@ -331,66 +248,10 @@ pub fn decrypt_container_v3<R: Read, W: Write>(
 
     let mut decrypt_reader = DecryptReader::new(reader, data_key.as_slice(), nonce, &header_bytes)?;
 
-    let mut chunks = Vec::with_capacity(header.chunk_count as usize);
-    for _ in 0..header.chunk_count {
-        let mut entry_buf = [0u8; CHUNK_LEN];
-        read_exact_plaintext(&mut decrypt_reader, &mut entry_buf)?;
-
-        let chunk_id = u32::from_le_bytes([entry_buf[0], entry_buf[1], entry_buf[2], entry_buf[3]]);
-        let chunk_type_raw = u16::from_le_bytes([entry_buf[4], entry_buf[5]]);
-        let flags = u16::from_le_bytes([entry_buf[6], entry_buf[7]]);
-        let offset = u64::from_le_bytes([
-            entry_buf[8],
-            entry_buf[9],
-            entry_buf[10],
-            entry_buf[11],
-            entry_buf[12],
-            entry_buf[13],
-            entry_buf[14],
-            entry_buf[15],
-        ]);
-        let length = u64::from_le_bytes([
-            entry_buf[16],
-            entry_buf[17],
-            entry_buf[18],
-            entry_buf[19],
-            entry_buf[20],
-            entry_buf[21],
-            entry_buf[22],
-            entry_buf[23],
-        ]);
-
-        let chunk_type = ChunkType::try_from(chunk_type_raw)?;
-
-        chunks.push(ChunkEntry {
-            chunk_id,
-            chunk_type,
-            flags,
-            offset,
-            length,
-        });
-    }
-
+    let chunks = read_chunk_entries_plaintext(&mut decrypt_reader, &header)?;
     let _data_start = validate_chunks(&header, &chunks)?;
 
-    let mut data_chunk_seen = false;
-    for chunk in &chunks {
-        if chunk.chunk_type == ChunkType::Data {
-            if data_chunk_seen {
-                return Err(FormatError::MultipleDataChunks);
-            }
-            data_chunk_seen = true;
-            if chunk.length > 0 {
-                copy_exact_plaintext(&mut decrypt_reader, writer, chunk.length)?;
-            }
-        } else if chunk.length > 0 {
-            skip_exact_plaintext(&mut decrypt_reader, chunk.length)?;
-        }
-    }
-
-    if !data_chunk_seen {
-        return Err(FormatError::MissingDataChunk);
-    }
+    extract_chunks_plaintext(&mut decrypt_reader, &chunks, data_out, metadata_out)?;
 
     let footer = read_footer_v1(&mut decrypt_reader)?;
     ensure_plaintext_eof(&mut decrypt_reader)?;
@@ -405,6 +266,16 @@ pub fn decrypt_container_v3<R: Read, W: Write>(
 pub fn decrypt_container_v4<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
+    key_material: &[u8],
+    recipient_type: WrapType,
+) -> Result<DecryptedContainer, FormatError> {
+    decrypt_container_v4_with_outputs(reader, Some(writer), None, key_material, recipient_type)
+}
+
+pub fn decrypt_container_v4_with_outputs<R: Read>(
+    reader: &mut R,
+    data_out: Option<&mut dyn Write>,
+    metadata_out: Option<&mut dyn Write>,
     key_material: &[u8],
     recipient_type: WrapType,
 ) -> Result<DecryptedContainer, FormatError> {
@@ -440,10 +311,29 @@ pub fn decrypt_container_v4<R: Read, W: Write>(
 
     let mut decrypt_reader = DecryptReader::new(reader, data_key.as_slice(), nonce, &header_bytes)?;
 
+    let chunks = read_chunk_entries_plaintext(&mut decrypt_reader, &header)?;
+    let _data_start = validate_chunks(&header, &chunks)?;
+
+    extract_chunks_plaintext(&mut decrypt_reader, &chunks, data_out, metadata_out)?;
+
+    let footer = read_footer_v1(&mut decrypt_reader)?;
+    ensure_plaintext_eof(&mut decrypt_reader)?;
+
+    Ok(DecryptedContainer {
+        header,
+        chunks,
+        footer,
+    })
+}
+
+fn read_chunk_entries_plaintext<R: Read>(
+    reader: &mut DecryptReader<R>,
+    header: &FileHeader,
+) -> Result<Vec<ChunkEntry>, FormatError> {
     let mut chunks = Vec::with_capacity(header.chunk_count as usize);
     for _ in 0..header.chunk_count {
         let mut entry_buf = [0u8; CHUNK_LEN];
-        read_exact_plaintext(&mut decrypt_reader, &mut entry_buf)?;
+        read_exact_plaintext(reader, &mut entry_buf)?;
 
         let chunk_id = u32::from_le_bytes([entry_buf[0], entry_buf[1], entry_buf[2], entry_buf[3]]);
         let chunk_type_raw = u16::from_le_bytes([entry_buf[4], entry_buf[5]]);
@@ -480,20 +370,53 @@ pub fn decrypt_container_v4<R: Read, W: Write>(
         });
     }
 
-    let _data_start = validate_chunks(&header, &chunks)?;
+    Ok(chunks)
+}
 
+fn extract_chunks_plaintext<R: Read>(
+    reader: &mut DecryptReader<R>,
+    chunks: &[ChunkEntry],
+    mut data_out: Option<&mut dyn Write>,
+    mut metadata_out: Option<&mut dyn Write>,
+) -> Result<(), FormatError> {
     let mut data_chunk_seen = false;
-    for chunk in &chunks {
-        if chunk.chunk_type == ChunkType::Data {
-            if data_chunk_seen {
-                return Err(FormatError::MultipleDataChunks);
+    let mut metadata_chunk_seen = false;
+
+    for chunk in chunks {
+        match chunk.chunk_type {
+            ChunkType::Data => {
+                if data_chunk_seen {
+                    return Err(FormatError::MultipleDataChunks);
+                }
+                data_chunk_seen = true;
+                if chunk.length > 0 {
+                    if let Some(writer) = data_out.as_deref_mut() {
+                        copy_exact_plaintext(reader, writer, chunk.length)?;
+                    } else {
+                        skip_exact_plaintext(reader, chunk.length)?;
+                    }
+                }
             }
-            data_chunk_seen = true;
-            if chunk.length > 0 {
-                copy_exact_plaintext(&mut decrypt_reader, writer, chunk.length)?;
+            ChunkType::Metadata => {
+                if metadata_out.is_some() {
+                    if metadata_chunk_seen {
+                        return Err(FormatError::MultipleMetadataChunks);
+                    }
+                    metadata_chunk_seen = true;
+                }
+                if chunk.length > 0 {
+                    if let Some(writer) = metadata_out.as_deref_mut() {
+                        copy_exact_plaintext(reader, writer, chunk.length)?;
+                    } else {
+                        skip_exact_plaintext(reader, chunk.length)?;
+                    }
+                }
             }
-        } else if chunk.length > 0 {
-            skip_exact_plaintext(&mut decrypt_reader, chunk.length)?;
+            _ => {
+                if chunk.length > 0 {
+                    skip_exact_plaintext(reader, chunk.length)?;
+                }
+            }
         }
     }
 
@@ -501,14 +424,11 @@ pub fn decrypt_container_v4<R: Read, W: Write>(
         return Err(FormatError::MissingDataChunk);
     }
 
-    let footer = read_footer_v1(&mut decrypt_reader)?;
-    ensure_plaintext_eof(&mut decrypt_reader)?;
+    if metadata_out.is_some() && !metadata_chunk_seen {
+        return Err(FormatError::MissingMetadataChunk);
+    }
 
-    Ok(DecryptedContainer {
-        header,
-        chunks,
-        footer,
-    })
+    Ok(())
 }
 
 pub fn rotate_container_v3<R: Read, W: Write>(
@@ -1490,7 +1410,7 @@ fn copy_exact_update<R: Read, W: Write + ?Sized>(
     Ok(())
 }
 
-fn copy_exact_plaintext<R: Read, W: Write>(
+fn copy_exact_plaintext<R: Read, W: Write + ?Sized>(
     reader: &mut DecryptReader<R>,
     writer: &mut W,
     mut len: u64,

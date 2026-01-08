@@ -412,6 +412,10 @@ pub enum FormatError {
     MissingDataChunk,
     #[error("multiple data chunks detected")]
     MultipleDataChunks,
+    #[error("missing metadata chunk")]
+    MissingMetadataChunk,
+    #[error("multiple metadata chunks detected")]
+    MultipleMetadataChunks,
     #[error("invalid footer magic")]
     InvalidFooterMagic { found: [u8; 4] },
     #[error("unsupported checksum type: {0}")]

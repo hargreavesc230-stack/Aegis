@@ -55,6 +55,7 @@ set DEC_FILE=%TMP_DIR%\decrypted.bin
 set DEC_FILE_2=%TMP_DIR%\decrypted2.bin
 set DEC_FILE_3=%TMP_DIR%\decrypted3.bin
 set DEC_FILE_PUB=%TMP_DIR%\decrypted_pub.bin
+set DEC_META=%TMP_DIR%\decrypted_meta.bin
 set WRONG_DEC_FILE=%TMP_DIR%\wrong_dec.bin
 set WRONG_DEC_TMP=%TMP_DIR%\wrong_dec.tmp
 set PW_ENC_FILE=%TMP_DIR%\pw_encrypted.aegis
@@ -94,15 +95,21 @@ if errorlevel 1 goto fail
 echo Encrypting payload (multi-recipient)...
 set AEGIS_PASSWORD=mock-pass-123
 set AEGIS_PASSWORD_CONFIRM=mock-pass-123
-cargo run -p aegis-cli -- enc "%INPUT_FILE%" "%ENC_FILE%" --recipient-key "%KEY_FILE%" --recipient-key "%KEY_FILE_2%" --recipient-password --recipient-pubkey "%PUB_KEY_FILE%" --allow-mixed-recipients
+cargo run -p aegis-cli -- enc "%INPUT_FILE%" "%ENC_FILE%" --metadata "%META_FILE%" --recipient-key "%KEY_FILE%" --recipient-key "%KEY_FILE_2%" --recipient-password --recipient-pubkey "%PUB_KEY_FILE%" --allow-mixed-recipients
 if errorlevel 1 goto fail
 set AEGIS_PASSWORD=
 set AEGIS_PASSWORD_CONFIRM=
 
 echo Decrypting payload (recipient 1)...
-cargo run -p aegis-cli -- dec "%ENC_FILE%" "%DEC_FILE%" --recipient-key "%KEY_FILE%"
+cargo run -p aegis-cli -- dec "%ENC_FILE%" "%DEC_FILE%" --recipient-key "%KEY_FILE%" --metadata "%DEC_META%"
 if errorlevel 1 goto fail
 fc /b "%INPUT_FILE%" "%DEC_FILE%" >nul
+if errorlevel 1 goto fail
+fc /b "%META_FILE%" "%DEC_META%" >nul
+if errorlevel 1 goto fail
+
+echo Verifying container...
+cargo run -p aegis-cli -- verify "%ENC_FILE%" --recipient-key "%KEY_FILE%"
 if errorlevel 1 goto fail
 
 echo Decrypting payload (recipient 2)...

@@ -258,8 +258,37 @@ pub fn write_encrypted_container_v3<W: Write>(
     chunks: &mut [WriteChunkSource],
     recipients: &[RecipientSpec<'_>],
 ) -> Result<WrittenEncryptedContainer, FormatError> {
-    use std::collections::HashSet;
+    let requires_password_params = validate_v3_recipients(recipients)?;
+    let kdf_params = if requires_password_params {
+        DEFAULT_PASSWORD_PARAMS
+    } else {
+        DEFAULT_KEYFILE_PARAMS
+    };
 
+    write_encrypted_container_v3_with_kdf(writer, chunks, recipients, kdf_params)
+}
+
+pub fn write_encrypted_container_v4<W: Write>(
+    writer: &mut W,
+    chunks: &mut [WriteChunkSource],
+    recipients: &[RecipientSpec<'_>],
+) -> Result<WrittenEncryptedContainer, FormatError> {
+    let info = validate_v4_recipients(recipients)?;
+    let kdf_params = if info.requires_password_params {
+        DEFAULT_PASSWORD_PARAMS
+    } else {
+        DEFAULT_KEYFILE_PARAMS
+    };
+
+    write_encrypted_container_v4_with_kdf(writer, chunks, recipients, kdf_params)
+}
+
+pub fn write_encrypted_container_v3_with_kdf<W: Write>(
+    writer: &mut W,
+    chunks: &mut [WriteChunkSource],
+    recipients: &[RecipientSpec<'_>],
+    kdf_params: KdfParams,
+) -> Result<WrittenEncryptedContainer, FormatError> {
     if chunks.len() > MAX_CHUNK_COUNT as usize {
         return Err(FormatError::ChunkCountTooLarge);
     }
@@ -267,25 +296,7 @@ pub fn write_encrypted_container_v3<W: Write>(
         return Err(FormatError::MissingRecipients);
     }
 
-    let mut ids = HashSet::with_capacity(recipients.len());
-    let mut requires_password_params = false;
-    for recipient in recipients {
-        if recipient.recipient_type == WrapType::PublicKey || recipient.public_key.is_some() {
-            return Err(FormatError::UnsupportedWrapType(WrapType::PublicKey as u16));
-        }
-        if !ids.insert(recipient.recipient_id) {
-            return Err(FormatError::DuplicateRecipientId(recipient.recipient_id));
-        }
-        if recipient.recipient_type == WrapType::Password {
-            requires_password_params = true;
-        }
-    }
-
-    let kdf_params = if requires_password_params {
-        DEFAULT_PASSWORD_PARAMS
-    } else {
-        DEFAULT_KEYFILE_PARAMS
-    };
+    let _ = validate_v3_recipients(recipients)?;
 
     let chunk_count = chunks.len() as u32;
     let salt = generate_salt(DEFAULT_SALT_LEN)?;
@@ -390,13 +401,12 @@ pub fn write_encrypted_container_v3<W: Write>(
     })
 }
 
-pub fn write_encrypted_container_v4<W: Write>(
+pub fn write_encrypted_container_v4_with_kdf<W: Write>(
     writer: &mut W,
     chunks: &mut [WriteChunkSource],
     recipients: &[RecipientSpec<'_>],
+    kdf_params: KdfParams,
 ) -> Result<WrittenEncryptedContainer, FormatError> {
-    use std::collections::HashSet;
-
     if chunks.len() > MAX_CHUNK_COUNT as usize {
         return Err(FormatError::ChunkCountTooLarge);
     }
@@ -404,25 +414,7 @@ pub fn write_encrypted_container_v4<W: Write>(
         return Err(FormatError::MissingRecipients);
     }
 
-    let mut ids = HashSet::with_capacity(recipients.len());
-    let mut requires_password_params = false;
-    let mut has_public = false;
-    for recipient in recipients {
-        if !ids.insert(recipient.recipient_id) {
-            return Err(FormatError::DuplicateRecipientId(recipient.recipient_id));
-        }
-        match recipient.recipient_type {
-            WrapType::Password => requires_password_params = true,
-            WrapType::PublicKey => has_public = true,
-            WrapType::Keyfile => {}
-        }
-    }
-
-    let kdf_params = if requires_password_params {
-        DEFAULT_PASSWORD_PARAMS
-    } else {
-        DEFAULT_KEYFILE_PARAMS
-    };
+    let info = validate_v4_recipients(recipients)?;
 
     let chunk_count = chunks.len() as u32;
     let salt = generate_salt(DEFAULT_SALT_LEN)?;
@@ -432,7 +424,7 @@ pub fn write_encrypted_container_v4<W: Write>(
 
     let mut ephemeral_private = None;
     let mut ephemeral_public = None;
-    if has_public {
+    if info.has_public {
         let (private, public) = generate_keypair()?;
         // The ephemeral private key is zeroized when it goes out of scope.
         ephemeral_private = Some(private);
@@ -567,6 +559,56 @@ pub fn write_encrypted_container_v4<W: Write>(
         header,
         chunks: entries,
         footer,
+    })
+}
+
+fn validate_v3_recipients(recipients: &[RecipientSpec<'_>]) -> Result<bool, FormatError> {
+    use std::collections::HashSet;
+
+    let mut ids = HashSet::with_capacity(recipients.len());
+    let mut requires_password_params = false;
+    for recipient in recipients {
+        if recipient.recipient_type == WrapType::PublicKey || recipient.public_key.is_some() {
+            return Err(FormatError::UnsupportedWrapType(WrapType::PublicKey as u16));
+        }
+        if !ids.insert(recipient.recipient_id) {
+            return Err(FormatError::DuplicateRecipientId(recipient.recipient_id));
+        }
+        if recipient.recipient_type == WrapType::Password {
+            requires_password_params = true;
+        }
+    }
+
+    Ok(requires_password_params)
+}
+
+struct RecipientSetInfo {
+    requires_password_params: bool,
+    has_public: bool,
+}
+
+fn validate_v4_recipients(
+    recipients: &[RecipientSpec<'_>],
+) -> Result<RecipientSetInfo, FormatError> {
+    use std::collections::HashSet;
+
+    let mut ids = HashSet::with_capacity(recipients.len());
+    let mut requires_password_params = false;
+    let mut has_public = false;
+    for recipient in recipients {
+        if !ids.insert(recipient.recipient_id) {
+            return Err(FormatError::DuplicateRecipientId(recipient.recipient_id));
+        }
+        match recipient.recipient_type {
+            WrapType::Password => requires_password_params = true,
+            WrapType::PublicKey => has_public = true,
+            WrapType::Keyfile => {}
+        }
+    }
+
+    Ok(RecipientSetInfo {
+        requires_password_params,
+        has_public,
     })
 }
 

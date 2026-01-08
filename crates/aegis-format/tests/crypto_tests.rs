@@ -3,10 +3,10 @@ use std::io::Cursor;
 use aegis_core::crypto::public_key::generate_keypair;
 use aegis_format::{
     decrypt_container_v2, decrypt_container_v3, decrypt_container_v4, read_header,
-    rotate_container_v3, write_encrypted_container, write_encrypted_container_password,
-    write_encrypted_container_v3, write_encrypted_container_v4, ChunkType, CryptoHeader,
-    FormatError, RecipientSpec, WrapType, WriteChunkSource, ACF_VERSION_V2, ACF_VERSION_V4,
-    HEADER_BASE_LEN, RECIPIENT_PUBLIC_KEY_LEN,
+    rotate_container_v3, rotate_container_v4, write_encrypted_container,
+    write_encrypted_container_password, write_encrypted_container_v3, write_encrypted_container_v4,
+    ChunkType, CryptoHeader, FormatError, RecipientSpec, WrapType, WriteChunkSource,
+    ACF_VERSION_V2, ACF_VERSION_V4, HEADER_BASE_LEN, RECIPIENT_PUBLIC_KEY_LEN,
 };
 use aegis_testkit::{flip_byte, sample_bytes};
 
@@ -447,6 +447,83 @@ fn rotation_preserves_payload() {
     )
     .expect("decrypt rotated");
     assert_eq!(out, data);
+}
+
+#[test]
+fn rotation_v4_add_remove_public_recipient() {
+    let keyfile = vec![0x3Au8; 32];
+    let (private_a, public_a) = generate_keypair().expect("keypair a");
+    let (private_b, public_b) = generate_keypair().expect("keypair b");
+    let data = sample_bytes(1024);
+    let mut chunks = vec![make_chunk(1, ChunkType::Data, data.clone())];
+
+    let recipients = vec![
+        RecipientSpec {
+            recipient_id: 1,
+            recipient_type: WrapType::Keyfile,
+            key_material: Some(&keyfile),
+            public_key: None,
+        },
+        RecipientSpec {
+            recipient_id: 2,
+            recipient_type: WrapType::PublicKey,
+            key_material: None,
+            public_key: Some(public_a),
+        },
+    ];
+
+    let mut container = Vec::new();
+    write_encrypted_container_v4(&mut container, &mut chunks, &recipients).expect("encrypt");
+
+    let add_specs = vec![RecipientSpec {
+        recipient_id: 3,
+        recipient_type: WrapType::PublicKey,
+        key_material: None,
+        public_key: Some(public_b),
+    }];
+
+    let mut rotated = Vec::new();
+    rotate_container_v4(
+        &mut Cursor::new(container),
+        &mut rotated,
+        &keyfile,
+        WrapType::Keyfile,
+        &add_specs,
+        &[2],
+    )
+    .expect("rotate");
+
+    let mut out_key = Vec::new();
+    decrypt_container_v4(
+        &mut Cursor::new(rotated.clone()),
+        &mut out_key,
+        &keyfile,
+        WrapType::Keyfile,
+    )
+    .expect("keyfile decrypt");
+    assert_eq!(out_key, data);
+
+    let mut out_pub = Vec::new();
+    decrypt_container_v4(
+        &mut Cursor::new(rotated.clone()),
+        &mut out_pub,
+        private_b.as_ref(),
+        WrapType::PublicKey,
+    )
+    .expect("public decrypt");
+    assert_eq!(out_pub, data);
+
+    let err = decrypt_container_v4(
+        &mut Cursor::new(rotated),
+        &mut Vec::new(),
+        private_a.as_ref(),
+        WrapType::PublicKey,
+    )
+    .expect_err("old public key should fail");
+    assert!(matches!(
+        err,
+        FormatError::Crypto(_) | FormatError::RecipientTypeNotFound
+    ));
 }
 
 #[test]

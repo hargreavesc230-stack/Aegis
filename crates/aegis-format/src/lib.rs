@@ -15,12 +15,16 @@ pub use acf::{
     RECIPIENT_PUBLIC_EXTRA_LEN, RECIPIENT_PUBLIC_KEY_LEN,
 };
 pub use reader::{
-    decrypt_container, decrypt_container_v2, decrypt_container_v3, decrypt_container_v4,
-    extract_data_chunk, read_container, read_container_with_status, read_header,
-    rotate_container_v3, rotate_container_v4, DecryptedContainer, ParsedContainer,
+    decrypt_container, decrypt_container_v1_with_outputs, decrypt_container_v2,
+    decrypt_container_v2_with_outputs, decrypt_container_v3, decrypt_container_v3_with_outputs,
+    decrypt_container_v4, decrypt_container_v4_with_outputs, extract_data_chunk, read_container,
+    read_container_with_status, read_header, rotate_container_v3, rotate_container_v4,
+    DecryptedContainer, ParsedContainer,
 };
 pub use writer::{
     write_container, write_encrypted_container, write_encrypted_container_password,
-    write_encrypted_container_v2, write_encrypted_container_v3, write_encrypted_container_v4,
-    RecipientSpec, WriteChunkSource, WrittenContainer, WrittenEncryptedContainer,
+    write_encrypted_container_v2, write_encrypted_container_v3,
+    write_encrypted_container_v3_with_kdf, write_encrypted_container_v4,
+    write_encrypted_container_v4_with_kdf, RecipientSpec, WriteChunkSource, WrittenContainer,
+    WrittenEncryptedContainer,
 };

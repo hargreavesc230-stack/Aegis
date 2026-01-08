@@ -92,23 +92,21 @@ Any of the following require a major version bump:
 
 ```
 cargo run -p aegis-cli -- keygen C:\path\to\aegis.key
-cargo run -p aegis-cli -- enc C:\path\to\input.bin C:\path\to\output.aegis --recipient-key C:\path\to\aegis.key
+cargo run -p aegis-cli -- enc C:\path\to\input.bin C:\path\to\output.aegis --recipient-key C:\path\to\aegis.key --metadata C:\path\to\meta.bin
 ```
 
 ### Encrypt with a password
 
 ```
-set AEGIS_PASSWORD=example-pass-123
-set AEGIS_PASSWORD_CONFIRM=example-pass-123
-cargo run -p aegis-cli -- enc C:\path\to\input.bin C:\path\to\output.aegis --recipient-password
-set AEGIS_PASSWORD=
-set AEGIS_PASSWORD_CONFIRM=
+cargo run -p aegis-cli -- enc C:\path\to\input.bin C:\path\to\output.aegis --recipient-password --password-file C:\path\to\password.txt
 ```
+
+Use `--password-stdin` to read the password from standard input without prompting.
 
 ### Decrypt
 
 ```
-cargo run -p aegis-cli -- dec C:\path\to\output.aegis C:\path\to\roundtrip.bin --recipient-key C:\path\to\aegis.key
+cargo run -p aegis-cli -- dec C:\path\to\output.aegis C:\path\to\roundtrip.bin --recipient-key C:\path\to\aegis.key --metadata C:\path\to\meta.bin
 ```
 
 ### Inspect containers
@@ -116,6 +114,12 @@ cargo run -p aegis-cli -- dec C:\path\to\output.aegis C:\path\to\roundtrip.bin -
 ```
 cargo run -p aegis-cli -- inspect C:\path\to\container.aegis
 cargo run -p aegis-cli -- inspect C:\path\to\container.aegis --json
+```
+
+### Verify containers (no plaintext output)
+
+```
+cargo run -p aegis-cli -- verify C:\path\to\container.aegis --recipient-key C:\path\to\aegis.key
 ```
 
 ### Examples
@@ -178,12 +182,15 @@ SHA-256 hashes.
 
 ## Testing and validation
 
-`scripts\check.bat` is the authoritative release gate. A release is invalid unless it passes.
-The script runs formatting, clippy, tests, fuzz-lite, happy-path integration, refusal tests,
-tamper/corruption checks, stress cases, and cleanup verification using mock data only.
+`scripts\check.bat` (Windows) and `scripts/check.sh` (Linux/macOS) are the authoritative
+release gates. A release is invalid unless the appropriate script passes. The scripts run
+formatting, clippy, tests, fuzz-lite, happy-path integration, refusal tests, tamper/corruption
+checks, stress cases, and cleanup verification using mock data only.
 
 ```
 scripts\check.bat
+
+scripts/check.sh
 ```
 
 ## Fuzzing (fuzz-lite)
@@ -222,11 +229,20 @@ cargo run -p aegis-cli -- keygen --public C:\path\to\recipient.pub --private C:\
 :: Encrypt with multiple recipient types (explicitly allowed)
 cargo run -p aegis-cli -- enc C:\path\to\input.bin C:\path\to\output.aegis --recipient-key C:\path\to\aegis.key --recipient-password --allow-mixed-recipients
 
+:: Encrypt with custom KDF tuning
+cargo run -p aegis-cli -- enc C:\path\to\input.bin C:\path\to\output.aegis --recipient-password --kdf-preset password --kdf-memory-kib 262144
+
+:: Encrypt from stdin to stdout
+type C:\path\to\input.bin | cargo run -p aegis-cli -- enc --stdin --stdout --recipient-key C:\path\to\aegis.key > C:\path\to\output.aegis
+
 :: Encrypt with a public-key recipient (ACF v4)
 cargo run -p aegis-cli -- enc C:\path\to\input.bin C:\path\to\output.aegis --recipient-pubkey C:\path\to\recipient.pub
 
 :: Decrypt with a key file (ACF v3/v4)
 cargo run -p aegis-cli -- dec C:\path\to\output.aegis C:\path\to\roundtrip.bin --recipient-key C:\path\to\aegis.key
+
+:: Decrypt to stdout
+cargo run -p aegis-cli -- dec C:\path\to\output.aegis --stdout --recipient-key C:\path\to\aegis.key > C:\path\to\roundtrip.bin
 
 :: Decrypt with a password (ACF v3/v4)
 cargo run -p aegis-cli -- dec C:\path\to\output.aegis C:\path\to\roundtrip.bin --recipient-password
@@ -236,9 +252,13 @@ cargo run -p aegis-cli -- dec C:\path\to\output.aegis C:\path\to\roundtrip.bin -
 
 :: List recipients in a container
 cargo run -p aegis-cli -- list-recipients C:\path\to\output.aegis
+cargo run -p aegis-cli -- list-recipients C:\path\to\output.aegis --json
 
 :: Rotate recipients (add/remove without re-encrypting the payload)
 cargo run -p aegis-cli -- rotate C:\path\to\output.aegis --output C:\path\to\rotated.aegis --auth-key C:\path\to\aegis.key --add-recipient-key C:\path\to\new.key --remove-recipient 1
+
+:: Verify a container without writing plaintext
+cargo run -p aegis-cli -- verify C:\path\to\output.aegis --recipient-key C:\path\to\aegis.key
 ```
 
 Logs are off by default. To enable logs:
